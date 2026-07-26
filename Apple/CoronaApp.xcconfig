@@ -1,0 +1,5 @@
+// CoronaApp.xcconfig
+#include "CoronaNative.xcconfig"
+
+HEADER_SEARCH_PATHS = $(inherited) "$(SRCROOT)/shared"
+OTHER_LDFLAGS = $(inherited) -framework Foundation -framework Network

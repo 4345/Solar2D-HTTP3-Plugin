@@ -1,0 +1,35 @@
+# Исключения Git для проекта плагина Solar2D HTTP/3
+
+# Временные файлы компиляции C/C++ и Visual Studio
+*.obj
+*.tlog
+*.pdb
+*.idb
+*.exp
+*.ilk
+*.aps
+*.ncb
+*.user
+*.suo
+*.VC.db
+UpgradeLog.htm
+
+# Логи и временные файлы сборки
+*.log
+*.tmp
+.vs/
+bin/
+obj/
+
+# Временные артефакты Gradle и Android
+.gradle/
+android/build/
+android/.gradle/
+android/plugin/build/kotlin/
+android/plugin/build/tmp/
+android/plugin/build/reports/
+
+# Промежуточные кэши ОС
+.DS_Store
+Thumbs.db
+desktop.ini

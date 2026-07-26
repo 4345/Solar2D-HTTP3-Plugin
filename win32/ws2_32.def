@@ -1,0 +1,9 @@
+LIBRARY ws2_32.dll
+EXPORTS
+    WSAStartup@8
+    WSACleanup@0
+    socket@12
+    connect@12
+    closesocket@4
+    getaddrinfo@16
+    freeaddrinfo@4

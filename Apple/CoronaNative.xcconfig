@@ -1,0 +1,3 @@
+// CoronaNative.xcconfig
+HEADER_SEARCH_PATHS = $(inherited) "$(CORONA_ROOT)/Corona/ios/include/Corona" "$(CORONA_ROOT)/Corona/shared/include/Corona" "$(CORONA_ROOT)/Corona/shared/include/lua"
+LIBRARY_SEARCH_PATHS = $(inherited) "$(CORONA_ROOT)/Corona/ios/lib"

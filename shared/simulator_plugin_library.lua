@@ -1,0 +1,3 @@
+-- simulator_plugin_library.lua
+-- Пустой Lua-скрипт плагина для Windows-симулятора.
+-- Используется как заглушка для корректной работы сборщика LuaToCpp в MSBuild.

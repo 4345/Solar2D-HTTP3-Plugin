@@ -1,0 +1,24 @@
+; ПРИМЕЧАНИЕ: win32/winhttp.lib больше НЕ генерируется из этого .def файла —
+; lib.exe /def: (что MSVC, что llvm-lib) кодирует entryname как есть в PE
+; Import Name Table, включая "@N", а реальный winhttp.dll экспортирует эти
+; функции БЕЗ декорации (просто "WinHttpOpen", не "WinHttpOpen@20") — из-за
+; этого DLL, слинкованная против такого .lib, падает при загрузке с
+; ERROR_MOD_NOT_FOUND (126), хотя компилируется и линкуется без единой
+; ошибки. winhttp.lib теперь — прямая копия настоящей Windows SDK-библиотеки
+; (Windows Kits\10\Lib\<version>\um\x86\winhttp.lib), которая кодирует имена
+; правильно. Этот .def оставлен только как справочный список используемых
+; символов — держите в актуальном состоянии при добавлении новых WinHttp-
+; вызовов, но НЕ пересобирайте им winhttp.lib.
+LIBRARY winhttp.dll
+EXPORTS
+    WinHttpOpen@20=WinHttpOpen
+    WinHttpSetTimeouts@20=WinHttpSetTimeouts
+    WinHttpConnect@16=WinHttpConnect
+    WinHttpOpenRequest@28=WinHttpOpenRequest
+    WinHttpSendRequest@28=WinHttpSendRequest
+    WinHttpReceiveResponse@8=WinHttpReceiveResponse
+    WinHttpQueryHeaders@24=WinHttpQueryHeaders
+    WinHttpReadData@16=WinHttpReadData
+    WinHttpCloseHandle@4=WinHttpCloseHandle
+    WinHttpSetOption@16=WinHttpSetOption
+    WinHttpQueryOption@16=WinHttpQueryOption

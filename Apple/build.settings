@@ -1,0 +1,45 @@
+-- 3/build.settings
+-- Настройки проекта Solar2D для плагина plugin.http3
+settings =
+{
+	orientation =
+	{
+		default = "portrait",
+		supported = { "portrait" },
+	},
+
+	android =
+	{
+		minSdkVersion = "25",
+		usesPermissions =
+		{
+			"android.permission.INTERNET",
+		},
+	},
+
+	iphone =
+	{
+		xcassets = "Images.xcassets",
+		plist =
+		{
+			UIStatusBarHidden = false,
+			UILaunchStoryboardName = "LaunchScreen",
+			NSAppTransportSecurity =
+			{
+				NSAllowsArbitraryLoads = true,
+			},
+		},
+	},
+
+	plugins =
+	{
+		["plugin.http3"] = { publisherId = "com.solar2d.http3" },
+	},
+
+	excludeFiles =
+	{
+		all = { "Icon.png", "Icon-*dpi.png", "._*", },
+		android = { "LaunchScreen.storyboardc", "*.dll", ".vscode", "*.lproj" },
+		ios = { "AndroidResources", "google-services.json", "*.dll" },
+	},
+}

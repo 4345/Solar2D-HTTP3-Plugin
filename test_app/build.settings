@@ -1,0 +1,67 @@
+-- -----------------------------------------------------------------------------
+-- test_app/build.settings
+-- Универсальные настройки сборки Solar2D для работы плагина plugin.http3 на всех платформах.
+-- -----------------------------------------------------------------------------
+
+settings =
+{
+	orientation =
+	{
+		default = "portrait",
+		supported = { "portrait", "portraitUpsideDown" },
+	},
+
+	android =
+	{
+		minSdkVersion = "21",
+		usesPermissions =
+		{
+			"android.permission.INTERNET",
+			"android.permission.ACCESS_NETWORK_STATE",
+		},
+	},
+
+	iphone =
+	{
+		xcassets = "Images.xcassets",
+		plist =
+		{
+			UIStatusBarHidden = false,
+			UILaunchStoryboardName = "LaunchScreen",
+			NSAppTransportSecurity =
+			{
+				NSAllowsArbitraryLoads = true,
+			},
+		},
+	},
+
+	win32 =
+	{
+		preference =
+		{
+			singleInstance = true,
+		},
+	},
+
+	window =
+	{
+		defaultMode = "normal",
+		titleText = "Solar2D HTTP/3 Plugin Multiplatform Test Suite",
+		resizable = true,
+		minWidth = 360,
+		minHeight = 640,
+	},
+
+	plugins =
+	{
+		["plugin.http3"] = { publisherId = "com.solar2d.http3" },
+	},
+
+	excludeFiles =
+	{
+		all = { "Icon.png", "Icon-*dpi.png", "._*", },
+		android = { "LaunchScreen.storyboardc", "*.dll", ".vscode", "*.lproj" },
+		ios = { "AndroidResources", "google-services.json", "*.dll", "*.so" },
+		win32 = { "LaunchScreen.storyboardc", "AndroidResources" },
+	},
+}
