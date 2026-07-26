@@ -176,14 +176,27 @@ function M.request(url, method, listener, params)
 
             -- Обратная совместимость с legacу-модулями, использующими checkRequest (polling)
             if cLib.checkRequest then
+                local startTime = (system and system.getTimer) and system.getTimer() or (os.time() * 1000)
+                local maxWaitMs = (timeout + 2.0) * 1000
+
                 local function check(evt)
                     local pollResult = cLib.checkRequest(reqId)
                     if pollResult then
-                        if Runtime and Runtime.removeEventListener then
+                        if Runtime and Runtime.removeEventListener and activeListeners[reqId] then
                             Runtime:removeEventListener("enterFrame", activeListeners[reqId])
                         end
                         activeListeners[reqId] = nil
                         wrapperListener(pollResult)
+                    else
+                        -- Предохранитель от утечки памяти: если нативный модуль завис или не вернул статус
+                        local now = (system and system.getTimer) and system.getTimer() or (os.time() * 1000)
+                        if (now - startTime) > maxWaitMs then
+                            if Runtime and Runtime.removeEventListener and activeListeners[reqId] then
+                                Runtime:removeEventListener("enterFrame", activeListeners[reqId])
+                            end
+                            activeListeners[reqId] = nil
+                            wrapperListener({ isError = true, error = "Request Timeout", reason = "Timeout" })
+                        end
                     end
                 end
 
@@ -265,10 +278,20 @@ end
 --- Запуск очистки мусора Lua и нативной памяти
 -- @return boolean Успешность операции
 function M.collectGarbage()
+    if activeListeners then
+        for reqId, listenerFunc in pairs(activeListeners) do
+            if Runtime and Runtime.removeEventListener then
+                Runtime:removeEventListener("enterFrame", listenerFunc)
+            end
+            activeListeners[reqId] = nil
+        end
+    end
+
     local cLib = loadNativeLibrary()
     if cLib and cLib.collectGarbage then
-        return cLib.collectGarbage()
+        cLib.collectGarbage()
     end
+
     collectgarbage("collect")
     collectgarbage("collect")
     return true

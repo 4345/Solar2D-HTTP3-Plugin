@@ -337,11 +337,10 @@ static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
         race->quicFinished = 2;
         if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
 
-        if (race->tcpFinished == 2) {
-            if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 3)) {
-                const char* msg = errMsg ? errMsg : "Transport failed";
-                AddResult(race->req->id, 1, 0, msg, MyStrLen(msg), "Error");
-            }
+        // Публикуем результат ошибки если TCP завершён, отменён или QUIC потерпел сбой
+        if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 3)) {
+            const char* msg = errMsg ? errMsg : "Transport failed";
+            AddResult(race->req->id, 1, 0, msg, MyStrLen(msg), "Error");
         }
     }
     CleanupRaceContext(race);
@@ -1654,9 +1653,25 @@ static int getMemoryStats( lua_State *L )
     return 1;
 }
 
+// Принудительное освобождение всех результатов из кучи
+static void FreeAllResults() {
+    EnterCriticalSection(&g_CritSec);
+    void* heap = GetProcessHeap();
+    RequestResult* curr = g_ResultsList;
+    while (curr) {
+        RequestResult* next = curr->next;
+        if (curr->response_data) HeapFree(heap, 0, curr->response_data);
+        HeapFree(heap, 0, curr);
+        curr = next;
+    }
+    g_ResultsList = NULL;
+    LeaveCriticalSection(&g_CritSec);
+}
+
 // Запуск сборки мусора
 static int collectGarbage( lua_State *L )
 {
+    FreeAllResults();
     lua_gc(L, LUA_GCCOLLECT, 0);
     lua_gc(L, LUA_GCCOLLECT, 0);
     lua_pushboolean(L, 1);

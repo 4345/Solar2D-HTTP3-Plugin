@@ -212,6 +212,7 @@ createButton(270, 470, 150, 38, "Пачка 50 REQ", {0.22, 0.65, 0.35}, functio
 
             if batchDone == batchTotal then
                 logMessage(string.format("✓ Пачка из 50 запросов завершена!"))
+                http3.collectGarbage()
             end
 
             updateUI()
