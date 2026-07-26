@@ -33,7 +33,7 @@ settings =
 
 	plugins =
 	{
-		["plugin.http3"] = { publisherId = "com.solar2d.http3" },
+		["plugin.http3"] = { publisherId = "ovh.azi" },
 	},
 
 	excludeFiles =

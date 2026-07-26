@@ -38,7 +38,7 @@ settings =
     {
         ["plugin.http3"] =
         {
-            publisherId = "com.solar2d.http3",
+            publisherId = "ovh.azi",
             supportedPlatforms =
             {
                 -- Нативная сборка для Windows Desktop

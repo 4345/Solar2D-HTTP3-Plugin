@@ -6,7 +6,7 @@
 # -----------------------------------------------------------------------------
 
 PLUGIN="${1:-plugin.http3}"
-PUBLISHER="${2:-com.solar2d.http3}"
+PUBLISHER="${2:-ovh.azi}"
 
 path=$(cd "$(dirname "$0")"; pwd)
 
