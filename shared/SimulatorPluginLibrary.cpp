@@ -1090,23 +1090,10 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
 
     if (outcome == RACE_SUCCESS) {
         LogMsg("Http3ThreadFunc: успешный ответ по MsQuic/HTTP3 (QUIC победил по Happy Eyeballs v3)");
-        race->quicSuccess = 1;
-        race->quicFinished = 1;
-        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
-        if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 1)) {
-            AddResult(race->req->id, 0, state->status, (const char*)state->respBody, state->respBodyLen, "MsQuic/HTTP3");
-        }
+        RaceFinish(race, RACE_SUCCESS, state->status, (const char*)state->respBody, state->respBodyLen, "MsQuic/HTTP3", NULL);
     } else {
         LogMsg("Http3ThreadFunc: сбой транспорта MsQuic/HTTP3");
-        race->quicSuccess = 0;
-        race->quicFinished = 2;
-        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
-
-        if (race->tcpFinished == 2) {
-            if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 3)) {
-                AddResult(race->req->id, 1, 0, "MsQuic/HTTP3 transport failed", 30, "Error");
-            }
-        }
+        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "Error", "MsQuic/HTTP3 transport failed");
     }
 
     LogMsg("Http3ThreadFunc: начало очистки MsQuic объектов сессии...");

@@ -9,10 +9,10 @@ package.path = "../lua/?.lua;../?.lua;./lua/?.lua;./?.lua;" .. package.path
 
 display.setStatusBar(display.HiddenStatusBar)
 
--- Подключение нативного или резервного модуля plugin_http3
-local status, http3 = pcall(require, "plugin_http3")
+-- Сначала пытаемся загрузить плагин plugin.http3, скачанный по ссылкам из build.settings
+local status, http3 = pcall(require, "plugin.http3")
 if not status or not http3 then
-    status, http3 = pcall(require, "plugin.http3")
+    status, http3 = pcall(require, "plugin_http3")
 end
 
 if not status or not http3 then
@@ -213,9 +213,8 @@ createButton(270, 470, 150, 38, "Пачка 50 REQ", {0.22, 0.65, 0.35}, functio
             if batchDone == batchTotal then
                 logMessage(string.format("✓ Пачка из 50 запросов завершена!"))
                 http3.collectGarbage()
+                updateUI()
             end
-
-            updateUI()
         end, { timeout = 10 })
     end
     updateUI()
