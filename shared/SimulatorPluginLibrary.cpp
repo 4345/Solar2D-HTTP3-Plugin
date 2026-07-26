@@ -302,6 +302,7 @@ typedef struct RaceContext {
     volatile long winnerAssigned; // 0 = none, 1 = QUIC, 2 = TCP, 3 = error
     volatile long quicFinished;   // 0 = in-flight, 1 = success, 2 = failed
     volatile long quicSuccess;    // 1 if QUIC succeeded, 0 if failed
+    volatile long quicProgress;   // 1 если QUIC успешно прошёл handshake/connected
     volatile long tcpFinished;    // 0 = in-flight, 1 = success, 2 = failed
     volatile long tcpSuccess;     // 1 if TCP succeeded, 0 if failed
     volatile long finishedCount;
@@ -780,6 +781,7 @@ typedef struct Http3State {
     HQUIC requestStream;
 
     AsyncRequestContext* req;
+    RaceContext* race;
     char host[256];
     char path[1024];
     int port;
@@ -862,6 +864,11 @@ static long __cdecl ConnectionCallback(HQUIC Connection, void* Context, QUIC_CON
     switch (Event->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED: {
             LogMsg("Http3ThreadFunc: QUIC handshake завершён (CONNECTED)");
+            // Фиксируем успешное установление QUIC связи по Happy Eyeballs v3, чтобы не запускать дублирующий TCP
+            if (state->race) {
+                state->race->quicProgress = 1;
+                if (state->race->quicDoneEvent) SetEvent(state->race->quicDoneEvent);
+            }
             LogMsg("ConnectionCallback: отправка HTTP/3 SETTINGS и HEADERS кадров...");
 
             {
@@ -1017,6 +1024,7 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     memset(state, 0, sizeof(Http3State));
     state->api = api;
     state->req = req;
+    state->race = race;
     state->port = port;
     MyStrCopy(state->host, sizeof(state->host), host);
     MyStrCopy(state->path, sizeof(state->path), path);
@@ -1340,14 +1348,15 @@ static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
         Sleep(250);
     }
 
-    // Если первичное подключение QUIC не завершилось успешно, задействуем вторичный TCP
-    if (race->quicSuccess == 0 && !race->winnerAssigned) {
-        LogMsg("RaceAndRequestThreadFunc: QUIC не завершился успешно (t=250ms или ошибка), запуск вторичной TCP попытки (Happy Eyeballs v3)...");
+    // По Happy Eyeballs v3 (RFC 8305): Если первичное QUIC-подключение НЕ установило связь (quicProgress == 0)
+    // и НЕ завершилось успешно (quicSuccess == 1) за 250 мс, задействуем вторичный TCP
+    if (race->quicSuccess == 0 && race->quicProgress == 0 && !race->winnerAssigned) {
+        LogMsg("RaceAndRequestThreadFunc: QUIC не установил соединение (t=250ms или ошибка), запуск вторичной TCP попытки (Happy Eyeballs v3)...");
         HANDLE hHttp1 = CreateThread(NULL, 0, Http1ThreadFunc, race, 0, NULL);
         if (hHttp1) CloseHandle(hHttp1);
     } else {
-        // TCP не запускается, поскольку QUIC уже успешно завершился и победил.
-        // Вызываем CleanupRaceContext за виртуально пропущенный поток TCP, чтобы память освободилась.
+        // TCP запуск отменяется: QUIC успешно установил соединение/прогресс и победил
+        LogMsg("RaceAndRequestThreadFunc: QUIC успешно установил соединение/прогресс, запуск TCP отменён");
         CleanupRaceContext(race);
     }
 

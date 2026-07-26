@@ -13,6 +13,7 @@
 *.suo
 *.VC.db
 UpgradeLog.htm
+*.pcapng
 
 # Логи и временные файлы сборки
 *.log

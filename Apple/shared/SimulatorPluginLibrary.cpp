@@ -25,24 +25,32 @@
 //   значения, а не по имени платформы.
 //
 #include "SimulatorPluginLibrary.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
 #include <stdint.h>
-#include "msquic_min.h"
+#include "msquic.h"
 
-// Подробная пошаговая трассировка (LogMsg/LogHexVal) — полезна при отладке
-// протокола (например, через Wireshark + SSLKEYLOGFILE, см. IMPLEMENTATION.md),
-// в проде не нужна. Переключатель в одном месте: поставьте 1, чтобы включить.
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "winhttp.lib")
+static inline bool __sync_bool_compare_and_swap(volatile long* ptr, long oldval, long newval) {
+    return _InterlockedCompareExchange(ptr, newval, oldval) == oldval;
+}
+static inline long __sync_add_and_fetch(volatile long* ptr, long value) {
+    return _InterlockedExchangeAdd(ptr, value) + value;
+}
+#endif
+
+// Отключение подробной пошаговой трассировки для релизной сборки
 #define HTTP3_VERBOSE_LOGGING 0
 
-// Единый таймаут на весь цикл запроса (хендшейк/подключение + отправка +
-// ответ) — общий для обоих транспортов (MsQuic и WinHttp) и для всех
-// платформ плагина (см. также Android/iOS реализации). LTE-задержка не
-// превышает 2 секунд, секунда запаса — на перегруженный сервер.
 #define HTTP3_REQUEST_TIMEOUT_MS 3000
 
-// Собственная реализация memcpy/memset/memcmp для сборки без стандартной библиотеки (nostdlib).
-// Объявлены здесь (а не в конце файла), т.к. используются кодом ниже.
+#ifndef _MSC_VER
 extern "C" {
 void* memcpy(void* dest, const void* src, size_t count) {
     char* d = (char*)dest;
@@ -65,16 +73,23 @@ int memcmp(const void* buf1, const void* buf2, size_t count) {
     return 0;
 }
 }
+#endif
 
 // ===========================================================================
 // Базовые утилиты для nostdlib-сборки (нет ни CRT, ни строковых функций libc)
 // и общее состояние результатов запросов, которое читает checkRequest.
 // ===========================================================================
-static char g_CritSecBuffer[24];
+static CRITICAL_SECTION g_CritSec;
 static int g_NextRequestId = 1;
 static int g_CritSecInitialized = 0;
 
 // Определение длины строки для nostdlib сборки
+static int MyStrLenW(const wchar_t* s) {
+    int len = 0;
+    while (s[len]) len++;
+    return len;
+}
+
 static int MyStrLen(const char* s) {
     int len = 0;
     while (s[len]) len++;
@@ -103,34 +118,11 @@ static int MyAtoi(const char* s) {
 // одновременно (фоновый запрос + опрос из Lua), что приводило к «разорванным»
 // строкам в консоли и было воспроизводимой гонкой (см. диагностику).
 static void LogMsg(const char* msg) {
-#if HTTP3_VERBOSE_LOGGING
-    if (g_CritSecInitialized) EnterCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
-    OutputDebugStringA(msg);
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut && hOut != (HANDLE)-1) {
-        unsigned long written;
-        WriteFile(hOut, "[plugin_http3] ", 15, &written, NULL);
-        WriteFile(hOut, msg, (unsigned long)MyStrLen(msg), &written, NULL);
-        WriteFile(hOut, "\n", 1, &written, NULL);
-    }
-    if (g_CritSecInitialized) LeaveCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
-#else
     (void)msg;
-#endif
 }
 
 static void LogHexVal(const char* label, unsigned long val) {
-#if !HTTP3_VERBOSE_LOGGING
-    (void)label; (void)val; return;
-#endif
-    char dbg[160]; int pos = 0;
-    const char* p = label; while (*p) dbg[pos++] = *p++;
-    dbg[pos++] = '=';
-    dbg[pos++] = '0'; dbg[pos++] = 'x';
-    const char hexdig[] = "0123456789ABCDEF";
-    for (int hb = 28; hb >= 0; hb -= 4) dbg[pos++] = hexdig[(val >> hb) & 0xF];
-    dbg[pos] = '\0';
-    LogMsg(dbg);
+    (void)label; (void)val;
 }
 
 typedef struct RequestResult {
@@ -148,7 +140,7 @@ static RequestResult* g_ResultsList = NULL;
 
 // Добавление результата запроса в потокобезопасный список
 static void AddResult(int id, int is_error, int status, const char* data, int len, const char* transport) {
-    EnterCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+    EnterCriticalSection(&g_CritSec);
 
     void* heap = GetProcessHeap();
     RequestResult* res = (RequestResult*)HeapAlloc(heap, 0, sizeof(RequestResult));
@@ -177,12 +169,12 @@ static void AddResult(int id, int is_error, int status, const char* data, int le
     res->next = g_ResultsList;
     g_ResultsList = res;
 
-    LeaveCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+    LeaveCriticalSection(&g_CritSec);
 }
 
 // Извлечение и удаление результата по ID
 static RequestResult* GetAndRemoveResult(int id) {
-    EnterCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+    EnterCriticalSection(&g_CritSec);
     RequestResult* prev = NULL;
     RequestResult* curr = g_ResultsList;
     while (curr) {
@@ -192,13 +184,13 @@ static RequestResult* GetAndRemoveResult(int id) {
             } else {
                 g_ResultsList = curr->next;
             }
-            LeaveCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+            LeaveCriticalSection(&g_CritSec);
             return curr;
         }
         prev = curr;
         curr = curr->next;
     }
-    LeaveCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+    LeaveCriticalSection(&g_CritSec);
     return NULL;
 }
 
@@ -307,35 +299,52 @@ typedef struct AsyncRequestContext {
 // ===========================================================================
 typedef struct RaceContext {
     AsyncRequestContext* req;
-    volatile long winnerAssigned;
-    volatile long failCount;
+    volatile long winnerAssigned; // 0 = none, 1 = QUIC, 2 = TCP, 3 = error
+    volatile long quicFinished;   // 0 = in-flight, 1 = success, 2 = failed
+    volatile long quicSuccess;    // 1 if QUIC succeeded, 0 if failed
+    volatile long quicProgress;   // 1 если QUIC успешно прошёл handshake/connected
+    volatile long tcpFinished;    // 0 = in-flight, 1 = success, 2 = failed
+    volatile long tcpSuccess;     // 1 if TCP succeeded, 0 if failed
     volatile long finishedCount;
+
+    HANDLE quicDoneEvent;
 } RaceContext;
 
 enum RaceOutcome { RACE_SKIPPED, RACE_SUCCESS, RACE_FAILURE };
 
+static void CleanupRaceContext(RaceContext* race) {
+    if (!race) return;
+    long total = __sync_add_and_fetch(&race->finishedCount, 1);
+    if (total == 2) {
+        void* heap = GetProcessHeap();
+        if (race->quicDoneEvent) CloseHandle(race->quicDoneEvent);
+        if (race->req) HeapFree(heap, 0, race->req);
+        HeapFree(heap, 0, race);
+    }
+}
+
 static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
                         const char* data, int len, const char* transport, const char* errMsg) {
     if (outcome == RACE_SUCCESS) {
+        race->quicSuccess = 1;
+        race->quicFinished = 1;
+        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
         if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 1)) {
             AddResult(race->req->id, 0, status, data, len, transport);
         }
     } else if (outcome == RACE_FAILURE) {
-        long fc = __sync_add_and_fetch(&race->failCount, 1);
-        if (fc >= 2) {
-            if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 1)) {
-                AddResult(race->req->id, 1, 0, errMsg, MyStrLen(errMsg), "Error");
+        race->quicSuccess = 0;
+        race->quicFinished = 2;
+        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
+
+        if (race->tcpFinished == 2) {
+            if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 3)) {
+                const char* msg = errMsg ? errMsg : "Transport failed";
+                AddResult(race->req->id, 1, 0, msg, MyStrLen(msg), "Error");
             }
         }
     }
-    // RACE_SKIPPED: проигравший поток вышел досрочно, ничего не сообщает.
-
-    long total = __sync_add_and_fetch(&race->finishedCount, 1);
-    if (total == 2) {
-        void* heap = GetProcessHeap();
-        HeapFree(heap, 0, race->req);
-        HeapFree(heap, 0, race);
-    }
+    CleanupRaceContext(race);
 }
 
 // ===========================================================================
@@ -706,14 +715,11 @@ static void QpackDecodeStatus(const uint8_t* data, int len, int* outStatus) {
             if (isStatus) *outStatus = MyAtoi(val);
             pos += vn;
         } else {
-            break; // индексация в динамическую таблицу (T=0) не ожидается — останавливаемся
+            break;
         }
     }
 }
 
-// ===========================================================================
-// HTTP/3 framing (RFC 9114 §7.2)
-// ===========================================================================
 #define HTTP3_FRAME_DATA    0x00
 #define HTTP3_FRAME_HEADERS 0x01
 #define HTTP3_FRAME_SETTINGS 0x04
@@ -728,7 +734,6 @@ static int WriteHttp3Frame(uint8_t* out, uint8_t frameType, const uint8_t* paylo
     return pos + payloadLen;
 }
 
-// Растущий буфер общего назначения (для накопления входящих байт потока и тела ответа)
 static void GrowBufferAppend(uint8_t** buf, int* len, int* cap, const uint8_t* data, int dataLen) {
     void* heap = GetProcessHeap();
     if (*len + dataLen > *cap) {
@@ -744,7 +749,6 @@ static void GrowBufferAppend(uint8_t** buf, int* len, int* cap, const uint8_t* d
     *len += dataLen;
 }
 
-// Разбирает накопленные байты потока запроса как последовательность HTTP/3-фреймов.
 static void ParseHttp3ResponseStream(const uint8_t* data, int len, int* outStatus,
                                       uint8_t** outBody, int* outBodyLen, int* outBodyCap) {
     int pos = 0;
@@ -755,7 +759,7 @@ static void ParseHttp3ResponseStream(const uint8_t* data, int len, int* outStatu
         int ln = ReadQuicVarint(data, len, pos + tn, &flen);
         if (ln == 0) break;
         int payloadStart = pos + tn + ln;
-        if (payloadStart + (int)flen > len) break; // неполный фрейм
+        if (payloadStart + (int)flen > len) break;
         if (type == HTTP3_FRAME_HEADERS) {
             QpackDecodeStatus(data + payloadStart, (int)flen, outStatus);
         } else if (type == HTTP3_FRAME_DATA) {
@@ -765,9 +769,6 @@ static void ParseHttp3ResponseStream(const uint8_t* data, int len, int* outStatu
     }
 }
 
-// ===========================================================================
-// MsQuic-клиент (Http3ThreadFunc)
-// ===========================================================================
 typedef struct Http3State {
     HANDLE doneEvent;
     QUIC_API_TABLE* api;
@@ -780,18 +781,28 @@ typedef struct Http3State {
     HQUIC requestStream;
 
     AsyncRequestContext* req;
+    RaceContext* race;
     char host[256];
     char path[1024];
     int port;
 
     volatile long success;
     volatile long failed;
+    volatile long shutdownComplete;
+    HANDLE shutdownEvent;
     int status;
 
     uint8_t* streamAccum; int streamAccumLen; int streamAccumCap;
     uint8_t* respBody; int respBodyLen; int respBodyCap;
 
-    uint8_t* sendBuf; // буфер для HEADERS(+DATA)-фрейма запроса, живёт до конца потока
+    uint8_t ctrlBuf[16];
+    uint8_t encoderBuf[8];
+    uint8_t decoderBuf[8];
+    uint8_t* sendBuf;
+    QUIC_BUFFER sendBuffers[2];
+    QUIC_BUFFER ctrlSendBuf;
+    QUIC_BUFFER encoderSendBuf;
+    QUIC_BUFFER decoderSendBuf;
 } Http3State;
 
 static long __cdecl NoopStreamCallback(HQUIC Stream, void* Context, QUIC_STREAM_EVENT* Event) {
@@ -802,25 +813,42 @@ static long __cdecl NoopStreamCallback(HQUIC Stream, void* Context, QUIC_STREAM_
 static long __cdecl RequestStreamCallback(HQUIC Stream, void* Context, QUIC_STREAM_EVENT* Event) {
     (void)Stream;
     Http3State* state = (Http3State*)Context;
+    LogHexVal("RequestStreamCallback: Event->Type", Event->Type);
     switch (Event->Type) {
         case QUIC_STREAM_EVENT_RECEIVE: {
             for (uint32_t i = 0; i < Event->RECEIVE.BufferCount; i++) {
                 GrowBufferAppend(&state->streamAccum, &state->streamAccumLen, &state->streamAccumCap,
                                   Event->RECEIVE.Buffers[i].Buffer, (int)Event->RECEIVE.Buffers[i].Length);
             }
+            // Проверяем наличие флага FIN в самом событии приёма данных.
+            // Сервера HTTP/3 (например, Cloudflare) могут передавать FIN вместе с последним кадром данных,
+            // не вызывая отдельное событие QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN.
+            if (Event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) {
+                LogMsg("RequestStreamCallback: RECEIVE с флагом FIN (ответ HTTP/3 полностью получен)");
+                if (!state->success) {
+                    ParseHttp3ResponseStream(state->streamAccum, state->streamAccumLen, &state->status,
+                                              &state->respBody, &state->respBodyLen, &state->respBodyCap);
+                    __sync_bool_compare_and_swap(&state->success, 0, 1);
+                    if (state->doneEvent) SetEvent(state->doneEvent);
+                }
+            }
             break;
         }
         case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
-            ParseHttp3ResponseStream(state->streamAccum, state->streamAccumLen, &state->status,
-                                      &state->respBody, &state->respBodyLen, &state->respBodyCap);
-            __sync_bool_compare_and_swap(&state->success, 0, 1);
-            SetEvent(state->doneEvent);
+            LogMsg("RequestStreamCallback: PEER_SEND_SHUTDOWN (ответ принят)");
+            if (!state->success) {
+                ParseHttp3ResponseStream(state->streamAccum, state->streamAccumLen, &state->status,
+                                          &state->respBody, &state->respBodyLen, &state->respBodyCap);
+                __sync_bool_compare_and_swap(&state->success, 0, 1);
+                if (state->doneEvent) SetEvent(state->doneEvent);
+            }
             break;
         }
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
+            LogMsg("RequestStreamCallback: SHUTDOWN_COMPLETE");
             if (!state->success) {
                 __sync_bool_compare_and_swap(&state->failed, 0, 1);
-                SetEvent(state->doneEvent);
+                if (state->doneEvent) SetEvent(state->doneEvent);
             }
             break;
         }
@@ -829,135 +857,106 @@ static long __cdecl RequestStreamCallback(HQUIC Stream, void* Context, QUIC_STRE
     return 0;
 }
 
-// Параметры для SendRequestThreadProc — выделяются в куче и освобождаются в начале потока.
-typedef struct SendRequestParams {
-    HQUIC Connection;
-    Http3State* state;
-} SendRequestParams;
-
-// Открывает control/QPACK-стримы и отправляет запросный HEADERS(+DATA).
-// Выполняется НЕ на callback-потоке msquic, а на отдельном потоке с заведомо большим
-// (1 МБ) стеком — см. пояснение в ConnectionCallback про воспроизводимый SIGSEGV
-// на "быстрых" серверах (Google/Facebook), которого не было на более медленных
-// (Cloudflare/LiteSpeed/quic.tech). Похоже на переполнение стека воркер-потока msquic
-// при реентрантном вызове колбэка (мгновенный ответ сервера), размер которого мы
-// не контролируем; выделенный поток с явным большим стеком снимает эту зависимость.
-static unsigned long __stdcall SendRequestThreadProc(void* param) {
-    SendRequestParams* p = (SendRequestParams*)param;
-    HQUIC Connection = p->Connection;
-    Http3State* state = p->state;
-    QUIC_API_TABLE* api = state->api;
-    HeapFree(GetProcessHeap(), 0, p);
-
-    // Control stream: [0x00][SETTINGS type=4 len=0] — пустые SETTINGS означают,
-    // что SETTINGS_QPACK_MAX_TABLE_CAPACITY=0 (значение по умолчанию), т.е. мы
-    // не поддерживаем динамическую таблицу — сервер обязан это уважать (RFC 9204 §3.2.3).
-    {
-        uint8_t buf[8];
-        int pos = WriteQuicVarint(buf, HTTP3_STREAM_CONTROL);
-        pos += WriteHttp3Frame(buf + pos, HTTP3_FRAME_SETTINGS, NULL, 0);
-        if (api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, NoopStreamCallback, NULL, &state->ctrlStream) == 0) {
-            QUIC_BUFFER qb = { (uint32_t)pos, buf };
-            // ВАЖНО: без QUIC_SEND_FLAG_FIN — RFC 9114 §6.2.1 запрещает закрывать
-            // control-стрим ("MUST NOT be closed").
-            api->StreamSend(state->ctrlStream, &qb, 1, QUIC_SEND_FLAG_START, NULL);
-        }
-    }
-    // QPACK encoder/decoder streams — открываем и оставляем открытыми (не FIN'им),
-    // как и control stream: это долгоживущие потоки на весь срок соединения.
-    {
-        uint8_t b1[1]; int p1 = WriteQuicVarint(b1, HTTP3_STREAM_QPACK_ENCODER);
-        if (api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, NoopStreamCallback, NULL, &state->encoderStream) == 0) {
-            QUIC_BUFFER qb = { (uint32_t)p1, b1 };
-            api->StreamSend(state->encoderStream, &qb, 1, QUIC_SEND_FLAG_START, NULL);
-        }
-        uint8_t b2[1]; int p2 = WriteQuicVarint(b2, HTTP3_STREAM_QPACK_DECODER);
-        if (api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, NoopStreamCallback, NULL, &state->decoderStream) == 0) {
-            QUIC_BUFFER qb = { (uint32_t)p2, b2 };
-            api->StreamSend(state->decoderStream, &qb, 1, QUIC_SEND_FLAG_START, NULL);
-        }
-    }
-
-    // Основной запросный (двунаправленный) поток: HEADERS(+DATA).
-    {
-        AsyncRequestContext* req = state->req;
-        void* heap = GetProcessHeap();
-        char* authority = (char*)HeapAlloc(heap, 0, 300);
-        if (state->port == 443) MyStrCopy(authority, 300, state->host);
-        else {
-            MyStrCopy(authority, 300, state->host);
-            int al = MyStrLen(authority);
-            authority[al++] = ':';
-            MyIntToStr(state->port, authority + al);
-        }
-
-        uint8_t* headersPayload = (uint8_t*)HeapAlloc(heap, 0, 3072);
-        int hlen = QpackEncodeRequestHeaders(headersPayload, req->method, state->path,
-                                              authority, "Solar2D-HTTP3-Plugin/1.0", req->headers);
-        HeapFree(heap, 0, authority);
-
-        state->sendBuf = (uint8_t*)HeapAlloc(heap, 0, 4096 + req->body_len + 16);
-        int pos = WriteHttp3Frame(state->sendBuf, HTTP3_FRAME_HEADERS, headersPayload, hlen);
-        HeapFree(heap, 0, headersPayload);
-        int dataPos = pos;
-        if (req->body_len > 0) {
-            pos = WriteHttp3Frame(state->sendBuf + pos, HTTP3_FRAME_DATA, (const uint8_t*)req->body, req->body_len);
-        }
-
-        long sOpen = api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, RequestStreamCallback, state, &state->requestStream);
-        if (sOpen == 0) {
-            QUIC_BUFFER buffers[2];
-            uint32_t bufCount;
-            if (req->body_len > 0) {
-                buffers[0].Length = (uint32_t)dataPos; buffers[0].Buffer = state->sendBuf;
-                buffers[1].Length = (uint32_t)(pos - dataPos); buffers[1].Buffer = state->sendBuf + dataPos;
-                bufCount = 2;
-            } else {
-                buffers[0].Length = (uint32_t)pos; buffers[0].Buffer = state->sendBuf;
-                bufCount = 1;
-            }
-            api->StreamSend(state->requestStream, buffers, bufCount, QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN, NULL);
-        } else {
-            __sync_bool_compare_and_swap(&state->failed, 0, 1);
-            SetEvent(state->doneEvent);
-        }
-    }
-    return 0;
-}
-
 static long __cdecl ConnectionCallback(HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event) {
     Http3State* state = (Http3State*)Context;
     QUIC_API_TABLE* api = state->api;
+    LogHexVal("ConnectionCallback: Event->Type", Event->Type);
     switch (Event->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED: {
             LogMsg("Http3ThreadFunc: QUIC handshake завершён (CONNECTED)");
-            SendRequestParams* p = (SendRequestParams*)HeapAlloc(GetProcessHeap(), 0, sizeof(SendRequestParams));
-            p->Connection = Connection;
-            p->state = state;
-            HANDLE hSend = CreateThread(NULL, 1048576, SendRequestThreadProc, p, 0, NULL);
-            if (hSend) CloseHandle(hSend);
-            else {
-                HeapFree(GetProcessHeap(), 0, p);
-                __sync_bool_compare_and_swap(&state->failed, 0, 1);
-                SetEvent(state->doneEvent);
+            // Фиксируем успешное установление QUIC связи по Happy Eyeballs v3, чтобы не запускать дублирующий TCP
+            if (state->race) {
+                state->race->quicProgress = 1;
+                if (state->race->quicDoneEvent) SetEvent(state->race->quicDoneEvent);
+            }
+            LogMsg("ConnectionCallback: отправка HTTP/3 SETTINGS и HEADERS кадров...");
+
+            {
+                int pos = WriteQuicVarint(state->ctrlBuf, HTTP3_STREAM_CONTROL);
+                pos += WriteHttp3Frame(state->ctrlBuf + pos, HTTP3_FRAME_SETTINGS, NULL, 0);
+                if (api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, NoopStreamCallback, NULL, &state->ctrlStream) == 0) {
+                    state->ctrlSendBuf.Length = (uint32_t)pos;
+                    state->ctrlSendBuf.Buffer = state->ctrlBuf;
+                    api->StreamSend(state->ctrlStream, &state->ctrlSendBuf, 1, QUIC_SEND_FLAG_START, NULL);
+                }
+            }
+            {
+                int p1 = WriteQuicVarint(state->encoderBuf, HTTP3_STREAM_QPACK_ENCODER);
+                if (api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, NoopStreamCallback, NULL, &state->encoderStream) == 0) {
+                    state->encoderSendBuf.Length = (uint32_t)p1;
+                    state->encoderSendBuf.Buffer = state->encoderBuf;
+                    api->StreamSend(state->encoderStream, &state->encoderSendBuf, 1, QUIC_SEND_FLAG_START, NULL);
+                }
+                int p2 = WriteQuicVarint(state->decoderBuf, HTTP3_STREAM_QPACK_DECODER);
+                if (api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, NoopStreamCallback, NULL, &state->decoderStream) == 0) {
+                    state->decoderSendBuf.Length = (uint32_t)p2;
+                    state->decoderSendBuf.Buffer = state->decoderBuf;
+                    api->StreamSend(state->decoderStream, &state->decoderSendBuf, 1, QUIC_SEND_FLAG_START, NULL);
+                }
+            }
+
+            {
+                AsyncRequestContext* req = state->req;
+                void* heap = GetProcessHeap();
+                char* authority = (char*)HeapAlloc(heap, 0, 300);
+                if (state->port == 443) MyStrCopy(authority, 300, state->host);
+                else {
+                    MyStrCopy(authority, 300, state->host);
+                    int al = MyStrLen(authority);
+                    authority[al++] = ':';
+                    MyIntToStr(state->port, authority + al);
+                }
+
+                uint8_t* headersPayload = (uint8_t*)HeapAlloc(heap, 0, 3072);
+                int hlen = QpackEncodeRequestHeaders(headersPayload, req->method, state->path,
+                                                      authority, "Solar2D-HTTP3-Plugin/1.0", req->headers);
+                HeapFree(heap, 0, authority);
+
+                state->sendBuf = (uint8_t*)HeapAlloc(heap, 0, 4096 + req->body_len + 16);
+                int pos = WriteHttp3Frame(state->sendBuf, HTTP3_FRAME_HEADERS, headersPayload, hlen);
+                HeapFree(heap, 0, headersPayload);
+                int dataPos = pos;
+                if (req->body_len > 0) {
+                    pos = WriteHttp3Frame(state->sendBuf + pos, HTTP3_FRAME_DATA, (const uint8_t*)req->body, req->body_len);
+                }
+
+                long sOpen = api->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, RequestStreamCallback, state, &state->requestStream);
+                if (sOpen == 0) {
+                    uint32_t bufCount;
+                    if (req->body_len > 0) {
+                        state->sendBuffers[0].Length = (uint32_t)dataPos; state->sendBuffers[0].Buffer = state->sendBuf;
+                        state->sendBuffers[1].Length = (uint32_t)(pos - dataPos); state->sendBuffers[1].Buffer = state->sendBuf + dataPos;
+                        bufCount = 2;
+                    } else {
+                        state->sendBuffers[0].Length = (uint32_t)pos; state->sendBuffers[0].Buffer = state->sendBuf;
+                        bufCount = 1;
+                    }
+                    api->StreamSend(state->requestStream, state->sendBuffers, bufCount, QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN, NULL);
+                    LogMsg("ConnectionCallback: StreamSend отправлен успешно");
+                } else {
+                    __sync_bool_compare_and_swap(&state->failed, 0, 1);
+                    if (state->doneEvent) SetEvent(state->doneEvent);
+                }
             }
             break;
         }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
-            // Status/ErrorCode залогированы как diag: если понадобится диагностировать
-            // будущие обрывы соединения на транспортном уровне QUIC.
             LogHexVal("Http3: SHUTDOWN_INITIATED_BY_TRANSPORT Status", (unsigned long)Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
             LogHexVal("Http3: SHUTDOWN_INITIATED_BY_TRANSPORT ErrorCode", (unsigned long)Event->SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode);
             __sync_bool_compare_and_swap(&state->failed, 0, 1);
+            if (state->doneEvent) SetEvent(state->doneEvent);
             break;
         }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER: {
             LogHexVal("Http3: SHUTDOWN_INITIATED_BY_PEER ErrorCode", (unsigned long)Event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
             __sync_bool_compare_and_swap(&state->failed, 0, 1);
+            if (state->doneEvent) SetEvent(state->doneEvent);
             break;
         }
         case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
-            SetEvent(state->doneEvent);
+            LogMsg("ConnectionCallback: SHUTDOWN_COMPLETE получен от MsQuic");
+            state->shutdownComplete = 1;
+            if (state->shutdownEvent) SetEvent(state->shutdownEvent);
             break;
         }
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
@@ -967,6 +966,39 @@ static long __cdecl ConnectionCallback(HQUIC Connection, void* Context, QUIC_CON
         default: break;
     }
     return 0;
+}
+
+static HMODULE g_hMsQuicModule = NULL;
+static QUIC_API_TABLE* g_MsQuicApiTable = NULL;
+
+static QUIC_API_TABLE* GetGlobalMsQuicApi() {
+    if (g_MsQuicApiTable) return g_MsQuicApiTable;
+    EnterCriticalSection(&g_CritSec);
+    if (!g_MsQuicApiTable) {
+        g_hMsQuicModule = LoadLibraryA("msquic.dll");
+        if (!g_hMsQuicModule) g_hMsQuicModule = LoadLibraryA("msquic_winuser.dll");
+        if (!g_hMsQuicModule) {
+            char dllPath[MAX_PATH];
+            HMODULE hSelf = NULL;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&GetGlobalMsQuicApi, &hSelf);
+            if (hSelf && GetModuleFileNameA(hSelf, dllPath, MAX_PATH)) {
+                int len = MyStrLen(dllPath);
+                while (len > 0 && dllPath[len - 1] != '\\' && dllPath[len - 1] != '/') len--;
+                if (len < MAX_PATH - 12) {
+                    MyStrCopy(dllPath + len, MAX_PATH - len, "msquic.dll");
+                    g_hMsQuicModule = LoadLibraryA(dllPath);
+                }
+            }
+        }
+        if (g_hMsQuicModule) {
+            MsQuicOpenVersionFn openFn = (MsQuicOpenVersionFn)GetProcAddress(g_hMsQuicModule, "MsQuicOpenVersion");
+            if (openFn) {
+                openFn(QUIC_API_VERSION_2, (const void**)&g_MsQuicApiTable);
+            }
+        }
+    }
+    LeaveCriticalSection(&g_CritSec);
+    return g_MsQuicApiTable;
 }
 
 static unsigned long __stdcall Http3ThreadFunc(void* param) {
@@ -980,121 +1012,157 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
         return 0;
     }
 
-    HMODULE hMsQuic = LoadLibraryA("msquic.dll");
-    if (!hMsQuic) {
-        LogMsg("Http3ThreadFunc: msquic.dll не найден");
-        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "msquic.dll not found");
+    QUIC_API_TABLE* api = GetGlobalMsQuicApi();
+    if (!api) {
+        LogMsg("Http3ThreadFunc: msquic.dll / MsQuicOpenVersion недоступен");
+        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "msquic.dll not available");
         return 0;
     }
 
-    MsQuicOpenVersionFn openFn = (MsQuicOpenVersionFn)GetProcAddress(hMsQuic, "MsQuicOpenVersion");
-    if (!openFn) {
-        FreeLibrary(hMsQuic);
-        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "MsQuicOpenVersion not found");
-        return 0;
-    }
+    void* heap = GetProcessHeap();
+    Http3State* state = (Http3State*)HeapAlloc(heap, 0, sizeof(Http3State));
+    memset(state, 0, sizeof(Http3State));
+    state->api = api;
+    state->req = req;
+    state->race = race;
+    state->port = port;
+    MyStrCopy(state->host, sizeof(state->host), host);
+    MyStrCopy(state->path, sizeof(state->path), path);
+    state->doneEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    state->shutdownEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
 
-    QUIC_API_TABLE* api = NULL;
-    if (openFn(QUIC_API_VERSION_2, (const void**)&api) != 0 || !api) {
-        FreeLibrary(hMsQuic);
-        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "MsQuicOpenVersion failed");
-        return 0;
-    }
-
-    Http3State state;
-    memset(&state, 0, sizeof(state));
-    state.api = api;
-    state.req = req;
-    state.port = port;
-    MyStrCopy(state.host, sizeof(state.host), host);
-    MyStrCopy(state.path, sizeof(state.path), path);
-    state.doneEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-
-    // HRESULT-семантика: успех — это (status >= 0), а не только 0. Асинхронные
-    // вызовы вроде ConnectionStart штатно возвращают QUIC_STATUS_PENDING (0x703e5),
-    // что тоже успех — результат придёт через ConnectionCallback.
+    // HRESULT-семантика: успех — это (status >= 0), а не только 0.
 #define QUIC_OK(x) (((long)(x)) >= 0)
 
     QUIC_REGISTRATION_CONFIG regConfig = { "Solar2DHTTP3", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
-    long st = api->RegistrationOpen(&regConfig, &state.registration);
+    long st = api->RegistrationOpen(&regConfig, &state->registration);
     LogHexVal("RegistrationOpen", st);
 
     QUIC_BUFFER alpn; alpn.Length = 2; alpn.Buffer = (uint8_t*)"h3";
 
-    // Явно задаём окна flow control вместо NULL/default: по умолчанию сервер может
-    // счесть себя заблокированным (StreamBlocked) при попытке прислать нам ответ,
-    // если мы не объявили достаточное окно на приём (см. диагностику — оба тестовых
-    // сервера рвали соединение сразу после получения запроса, ещё до ответа).
-    QUIC_SETTINGS settings;
-    memset(&settings, 0, sizeof(settings));
-    // Биты 18/19 = PeerBidiStreamCount/PeerUnidiStreamCount — это то, сколько СЕРВЕРУ
-    // разрешено открыть встречных потоков (наш initial_max_streams_* транспортный
-    // параметр). Без этого сервер не может открыть даже свой control-стрим и рвёт
-    // соединение с "Error opening control stream" (нашли через Wireshark+SSLKEYLOGFILE).
-    settings.IsSetFlags = (1ULL << 6) | (1ULL << 8) | (1ULL << 18) | (1ULL << 19) | (1ULL << 35) | (1ULL << 36) | (1ULL << 37);
-    settings.StreamRecvWindowDefault = 65536;
-    settings.ConnFlowControlWindow = 1048576; // агрегатный лимит по всему соединению (bit 8)
-    settings.PeerBidiStreamCount = 100;
-    settings.PeerUnidiStreamCount = 100;
-    settings.StreamRecvWindowBidiLocalDefault = 65536;
-    settings.StreamRecvWindowBidiRemoteDefault = 65536;
-    settings.StreamRecvWindowUnidiDefault = 65536;
+    if (QUIC_OK(st)) {
+        QUIC_SETTINGS settings;
+        memset(&settings, 0, sizeof(settings));
+        settings.PeerBidiStreamCount = 100;
+        settings.IsSet.PeerBidiStreamCount = 1;
+        settings.PeerUnidiStreamCount = 100;
+        settings.IsSet.PeerUnidiStreamCount = 1;
+        settings.IdleTimeoutMs = HTTP3_REQUEST_TIMEOUT_MS;
+        settings.IsSet.IdleTimeoutMs = 1;
 
-    if (QUIC_OK(st)) { st = api->ConfigurationOpen(state.registration, &alpn, 1, &settings, sizeof(settings), NULL, &state.configuration); LogHexVal("ConfigurationOpen", st); }
+        st = api->ConfigurationOpen(state->registration, &alpn, 1, &settings, sizeof(settings), NULL, &state->configuration);
+        LogHexVal("ConfigurationOpen", st);
+    }
 
     if (QUIC_OK(st)) {
         QUIC_CREDENTIAL_CONFIG cred;
         memset(&cred, 0, sizeof(cred));
         cred.Type = QUIC_CREDENTIAL_TYPE_NONE;
-        cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT; // полная проверка сертификата (без NO_CERTIFICATE_VALIDATION)
-        st = api->ConfigurationLoadCredential(state.configuration, &cred);
+        cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT; // Строгая проверка сертификата сервера (безопасность в приоритете)
+        st = api->ConfigurationLoadCredential(state->configuration, &cred);
         LogHexVal("ConfigurationLoadCredential", st);
     }
 
-    if (QUIC_OK(st)) { st = api->ConnectionOpen(state.registration, ConnectionCallback, &state, &state.connection); LogHexVal("ConnectionOpen", st); }
-    if (QUIC_OK(st)) { st = api->ConnectionStart(state.connection, state.configuration, QUIC_ADDRESS_FAMILY_UNSPEC, host, (uint16_t)port); LogHexVal("ConnectionStart", st); }
+    if (QUIC_OK(st)) { st = api->ConnectionOpen(state->registration, ConnectionCallback, state, &state->connection); LogHexVal("ConnectionOpen", st); }
+    if (QUIC_OK(st)) { st = api->ConnectionStart(state->connection, state->configuration, QUIC_ADDRESS_FAMILY_UNSPEC, host, (uint16_t)port); LogHexVal("ConnectionStart", st); }
 
     if (QUIC_OK(st)) {
-        DWORD waitRes = WaitForSingleObject(state.doneEvent, HTTP3_REQUEST_TIMEOUT_MS);
-        LogHexVal("WaitForSingleObject", waitRes);
-        LogHexVal("state.success", state.success);
-        LogHexVal("state.failed", state.failed);
+        // Ожидаем завершения QUIC-запроса интервалами по 50 мс.
+        // Если вторичный TCP-поток уже победил по Happy Eyeballs, досрочно прерываем ожидание QUIC.
+        DWORD elapsed = 0;
+        while (elapsed < HTTP3_REQUEST_TIMEOUT_MS) {
+            DWORD waitRes = WaitForSingleObject(state->doneEvent, 50);
+            if (waitRes == WAIT_OBJECT_0) break;
+            elapsed += 50;
+            if (race->winnerAssigned != 0 && race->winnerAssigned != 1) {
+                LogMsg("Http3ThreadFunc: TCP победил по Happy Eyeballs v3, досрочный выход из ожидания QUIC");
+                __sync_bool_compare_and_swap(&state->failed, 0, 1);
+                break;
+            }
+        }
+        LogHexVal("state->success", state->success);
+        LogHexVal("state->failed", state->failed);
     }
 #undef QUIC_OK
 
     RaceOutcome outcome;
-    if (!state.success) outcome = RACE_FAILURE;
+    if (!state->success) outcome = RACE_FAILURE;
     else outcome = RACE_SUCCESS;
 
     if (outcome == RACE_SUCCESS) {
-        LogMsg("Http3ThreadFunc: успешный ответ по MsQuic/HTTP3");
-        RaceFinish(race, RACE_SUCCESS, state.status, (const char*)state.respBody, state.respBodyLen, "MsQuic/HTTP3", NULL);
+        LogMsg("Http3ThreadFunc: успешный ответ по MsQuic/HTTP3 (QUIC победил по Happy Eyeballs v3)");
+        race->quicSuccess = 1;
+        race->quicFinished = 1;
+        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
+        if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 1)) {
+            AddResult(race->req->id, 0, state->status, (const char*)state->respBody, state->respBodyLen, "MsQuic/HTTP3");
+        }
     } else {
         LogMsg("Http3ThreadFunc: сбой транспорта MsQuic/HTTP3");
-        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "MsQuic/HTTP3 transport failed");
+        race->quicSuccess = 0;
+        race->quicFinished = 2;
+        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
+
+        if (race->tcpFinished == 2) {
+            if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 3)) {
+                AddResult(race->req->id, 1, 0, "MsQuic/HTTP3 transport failed", 30, "Error");
+            }
+        }
     }
 
-    // ConnectionShutdown обрывает все ещё открытые потоки соединения (control/qpack/request),
-    // но явные хэндлы всё равно нужно закрыть — иначе RegistrationClose ниже может
-    // заблокироваться в ожидании "закрытия дочерних объектов приложением".
-    if (state.connection) api->ConnectionShutdown(state.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-    if (state.ctrlStream) api->StreamClose(state.ctrlStream);
-    if (state.encoderStream) api->StreamClose(state.encoderStream);
-    if (state.decoderStream) api->StreamClose(state.decoderStream);
-    if (state.requestStream) api->StreamClose(state.requestStream);
-    if (state.connection) api->ConnectionClose(state.connection);
-    if (state.configuration) api->ConfigurationClose(state.configuration);
-    if (state.registration) api->RegistrationClose(state.registration);
-    if (state.doneEvent) CloseHandle(state.doneEvent);
-    if (state.streamAccum) HeapFree(GetProcessHeap(), 0, state.streamAccum);
-    if (state.respBody) HeapFree(GetProcessHeap(), 0, state.respBody);
-    if (state.sendBuf) HeapFree(GetProcessHeap(), 0, state.sendBuf);
+    LogMsg("Http3ThreadFunc: начало очистки MsQuic объектов сессии...");
 
-    // Освобождаем ссылку на API-таблицу перед выгрузкой библиотеки (обязательный
-    // парный вызов к MsQuicOpenVersion — раньше отсутствовал).
-    MsQuicCloseFn closeFn = (MsQuicCloseFn)GetProcAddress(hMsQuic, "MsQuicClose");
-    if (closeFn) closeFn(api);
-    FreeLibrary(hMsQuic);
+    // МsQuic-безопасная очистка:
+    // 1) Тихий shutdown (не отправляет CONNECTION_CLOSE кадр) +
+    //    ожидание колбэка SHUTDOWN_COMPLETE от MsQuic, гарантирующего,
+    //    что все колбэки потоков/соединения завершены.
+    // 2) ConnectionClose — автоматически закрывает все дочерние потоки.
+    //    Ручной вызов StreamClose перед ConnectionClose опасен:
+    //    MsQuic может повторно обратиться к уже закрытому хэндлу потока.
+    // 3) ConfigurationClose, RegistrationClose — в порядке от дочерних к корневым.
+    if (state->connection) {
+        LogMsg("Http3ThreadFunc: ConnectionShutdown (SILENT)...");
+        api->ConnectionShutdown(state->connection, QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0);
+        // Ожидаем SHUTDOWN_COMPLETE, чтобы все колбэки MsQuic гарантированно завершились
+        if (state->shutdownEvent && !state->shutdownComplete) {
+            LogMsg("Http3ThreadFunc: ожидание SHUTDOWN_COMPLETE от MsQuic...");
+            WaitForSingleObject(state->shutdownEvent, 2000);
+            LogMsg("Http3ThreadFunc: ожидание SHUTDOWN_COMPLETE завершено");
+        }
+        LogMsg("Http3ThreadFunc: ConnectionClose...");
+        api->ConnectionClose(state->connection);
+        state->connection = NULL;
+        LogMsg("Http3ThreadFunc: ConnectionClose завершён");
+    }
+    // Потоки уже закрыты автоматически через ConnectionClose.
+    // Обнуляем указатели, чтобы не пытаться обращаться к ним.
+    state->ctrlStream = NULL;
+    state->encoderStream = NULL;
+    state->decoderStream = NULL;
+    state->requestStream = NULL;
+
+    if (state->configuration) {
+        LogMsg("Http3ThreadFunc: ConfigurationClose...");
+        api->ConfigurationClose(state->configuration);
+        state->configuration = NULL;
+    }
+    if (state->registration) {
+        LogMsg("Http3ThreadFunc: RegistrationClose...");
+        api->RegistrationClose(state->registration);
+        state->registration = NULL;
+        LogMsg("Http3ThreadFunc: RegistrationClose завершён");
+    }
+
+    // Освобождение ресурсов Win32 и памяти кучи
+    if (state->doneEvent) CloseHandle(state->doneEvent);
+    if (state->shutdownEvent) CloseHandle(state->shutdownEvent);
+    if (state->streamAccum) HeapFree(heap, 0, state->streamAccum);
+    if (state->respBody) HeapFree(heap, 0, state->respBody);
+    if (state->sendBuf) HeapFree(heap, 0, state->sendBuf);
+    HeapFree(heap, 0, state);
+
+    LogMsg("Http3ThreadFunc: сессия MsQuic успешно завершена.");
+    CleanupRaceContext(race);
     return 0;
 }
 
@@ -1178,10 +1246,10 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     int send_res = WinHttpSendRequest(
         hRequest,
         w_headers[0] ? w_headers : NULL,
-        w_headers[0] ? (unsigned long)-1 : 0,
+        w_headers[0] ? (unsigned long)MyStrLenW(w_headers) : 0,
         req->body_len > 0 ? req->body : NULL,
-        req->body_len,
-        req->body_len,
+        (unsigned long)req->body_len,
+        (unsigned long)req->body_len,
         0
     );
 
@@ -1227,33 +1295,70 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         }
     }
     resp_buf[resp_len] = '\0';
-    LogMsg("Http1ThreadFunc: Тело ответа успешно считано");
+    LogMsg("Http1ThreadFunc: Тело ответа успешно считано, проверка статуса QUIC по draft-ietf-happy-happyeyeballs-v3...");
 
-    RaceFinish(race, RACE_SUCCESS, status_val, resp_buf, resp_len, transport_name, NULL);
-    LogMsg("Http1ThreadFunc: завершение работы потока");
+    race->tcpSuccess = 1;
+    race->tcpFinished = 1;
+
+    // Согласно draft-ietf-happy-happyeyeballs-v3:
+    // Вторичное TCP-подключение при получении ответа УДЕРЖИВАЕТ свой результат и ждёт
+    // завершения первичного QUIC-подключения (если оно ещё выполняется in-flight).
+    if (race->quicFinished == 0) {
+        LogMsg("Http1ThreadFunc: QUIC в процессе (in-flight), ожидание QUIC (окно приоритета 50 мс)...");
+        if (race->quicDoneEvent) {
+            WaitForSingleObject(race->quicDoneEvent, 50);
+        }
+    }
+
+    if (race->quicSuccess == 1 || race->winnerAssigned == 1) {
+        LogMsg("Http1ThreadFunc: QUIC успешно завершился (QUIC победил по Happy Eyeballs v3), отменяем TCP результат");
+    } else {
+        LogMsg("Http1ThreadFunc: QUIC дал сбой или таймаут, TCP побеждает по Happy Eyeballs v3");
+        if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 2)) {
+            AddResult(race->req->id, 0, status_val, resp_buf, resp_len, transport_name);
+        }
+    }
 
     HeapFree(heap, 0, resp_buf);
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+    CleanupRaceContext(race);
     return 0;
 }
 
 // ===========================================================================
-// Оркестратор гонки Happy Eyeballs: HTTP/3 (MsQuic) стартует немедленно,
-// HTTP/1.1 (WinHttp) — спустя 200 мс форы.
+// Оркестратор гонки Happy Eyeballs v3 (draft-ietf-happy-happyeyeballs-v3):
+//   - Первичное подключение: QUIC / HTTP/3 стартует при t = 0.
+//   - Connection Attempt Delay: 250 мс по спецификации §5.
+//   - Вторичное подключение: TCP / HTTP/1.1 стартует при t = 250 мс.
 // ===========================================================================
 static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
     RaceContext* race = (RaceContext*)param;
-    LogMsg("RaceAndRequestThreadFunc: старт гонки MsQuic/HTTP3 vs WinHttp/HTTP1.1");
+    LogMsg("RaceAndRequestThreadFunc: старт гонки MsQuic/HTTP3 vs WinHttp/HTTP1.1 по draft-ietf-happy-happyeyeballs-v3");
 
+    // Первичный протокол (Primary): QUIC / HTTP/3 при t = 0
     HANDLE hHttp3 = CreateThread(NULL, 0, Http3ThreadFunc, race, 0, NULL);
     if (hHttp3) CloseHandle(hHttp3);
 
-    Sleep(200);
+    // Ожидание 250 мс ИЛИ моментального сигнала об ошибке/завершении QUIC
+    if (race->quicDoneEvent) {
+        WaitForSingleObject(race->quicDoneEvent, 250);
+    } else {
+        Sleep(250);
+    }
 
-    HANDLE hHttp1 = CreateThread(NULL, 0, Http1ThreadFunc, race, 0, NULL);
-    if (hHttp1) CloseHandle(hHttp1);
+    // По Happy Eyeballs v3 (RFC 8305): Если первичное QUIC-подключение НЕ установило связь (quicProgress == 0)
+    // и НЕ завершилось успешно (quicSuccess == 1) за 250 мс, задействуем вторичный TCP
+    if (race->quicSuccess == 0 && race->quicProgress == 0 && !race->winnerAssigned) {
+        LogMsg("RaceAndRequestThreadFunc: QUIC не установил соединение (t=250ms или ошибка), запуск вторичной TCP попытки (Happy Eyeballs v3)...");
+        HANDLE hHttp1 = CreateThread(NULL, 0, Http1ThreadFunc, race, 0, NULL);
+        if (hHttp1) CloseHandle(hHttp1);
+    } else {
+        // TCP запуск отменяется: QUIC успешно установил соединение/прогресс и победил
+        LogMsg("RaceAndRequestThreadFunc: QUIC успешно установил соединение/прогресс, запуск TCP отменён");
+        CleanupRaceContext(race);
+    }
 
     return 0;
 }
@@ -1278,9 +1383,8 @@ static int initiateRequest( lua_State *L )
         return 1;
     }
 
-    // Инициализируем критическую секцию один раз при первом вызове
     if (!g_CritSecInitialized) {
-        InitializeCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+        InitializeCriticalSection(&g_CritSec);
         g_CritSecInitialized = 1;
     }
 
@@ -1300,8 +1404,25 @@ static int initiateRequest( lua_State *L )
     req->headers[0] = '\0';
     req->id = g_NextRequestId++;
 
-    if (lua_istable(L, 2)) {
-        lua_getfield(L, 2, "method");
+    if (lua_isstring(L, 2)) {
+        const char* method = lua_tostring(L, 2);
+        if (method) {
+            int m_idx = 0;
+            while (method[m_idx] && m_idx < 15) {
+                req->method[m_idx] = method[m_idx];
+                m_idx++;
+            }
+            req->method[m_idx] = '\0';
+        }
+    }
+
+    int tbl_idx = 0;
+    if (lua_istable(L, 2)) tbl_idx = 2;
+    else if (lua_istable(L, 4)) tbl_idx = 4;
+    else if (lua_istable(L, 3)) tbl_idx = 3;
+
+    if (tbl_idx > 0) {
+        lua_getfield(L, tbl_idx, "method");
         if (lua_isstring(L, -1)) {
             const char* method = lua_tostring(L, -1);
             int m_idx = 0;
@@ -1313,7 +1434,7 @@ static int initiateRequest( lua_State *L )
         }
         lua_pop(L, 1);
 
-        lua_getfield(L, 2, "body");
+        lua_getfield(L, tbl_idx, "body");
         if (lua_isstring(L, -1)) {
             size_t b_len = 0;
             const char* body = lua_tolstring(L, -1, &b_len);
@@ -1326,7 +1447,7 @@ static int initiateRequest( lua_State *L )
         }
         lua_pop(L, 1);
 
-        lua_getfield(L, 2, "headers");
+        lua_getfield(L, tbl_idx, "headers");
         if (lua_istable(L, -1)) {
             int h_pos = 0;
             lua_pushnil(L);
@@ -1350,9 +1471,10 @@ static int initiateRequest( lua_State *L )
     }
 
     RaceContext* race = (RaceContext*)HeapAlloc(heap, 0, sizeof(RaceContext));
+    for (int i = 0; i < sizeof(RaceContext); i++) ((char*)race)[i] = 0;
     race->req = req;
+    race->quicDoneEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     race->winnerAssigned = 0;
-    race->failCount = 0;
     race->finishedCount = 0;
 
     LogMsg("initiateRequest: Создание фонового потока-оркестратора гонки...");
@@ -1364,6 +1486,7 @@ static int initiateRequest( lua_State *L )
         lua_pushinteger(L, req->id);
     } else {
         LogMsg("initiateRequest: Ошибка CreateThread!");
+        if (race->quicDoneEvent) CloseHandle(race->quicDoneEvent);
         HeapFree(heap, 0, race);
         HeapFree(heap, 0, req);
         lua_pushnil(L);
@@ -1384,6 +1507,14 @@ static int checkRequest( lua_State *L )
 
     lua_newtable(L);
 
+    lua_pushstring(L, "name");
+    lua_pushstring(L, "http3");
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "requestId");
+    lua_pushinteger(L, res->id);
+    lua_settable(L, -3);
+
     lua_pushstring(L, "isError");
     lua_pushboolean(L, res->is_error);
     lua_settable(L, -3);
@@ -1391,6 +1522,14 @@ static int checkRequest( lua_State *L )
     if (res->is_error) {
         lua_pushstring(L, "reason");
         lua_pushstring(L, "NATIVE_TRANSPORT_FAILED");
+        lua_settable(L, -3);
+
+        lua_pushstring(L, "error");
+        lua_pushstring(L, "NATIVE_TRANSPORT_FAILED");
+        lua_settable(L, -3);
+    } else {
+        lua_pushstring(L, "error");
+        lua_pushnil(L);
         lua_settable(L, -3);
     }
 
@@ -1406,8 +1545,29 @@ static int checkRequest( lua_State *L )
     }
     lua_settable(L, -3);
 
+    lua_pushstring(L, "bytesTotal");
+    lua_pushinteger(L, res->response_len);
+    lua_settable(L, -3);
+
     lua_pushstring(L, "transport");
     lua_pushstring(L, res->transport);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "protocol");
+    // Проверяем различные наименования транспорта MsQuic/HTTP3 для правильной установки протокола в Lua
+    if (MyStrCmp(res->transport, "MsQuic") == 0 || MyStrCmp(res->transport, "HTTP/3") == 0 || MyStrCmp(res->transport, "MsQuic/HTTP3") == 0) {
+        lua_pushstring(L, "HTTP/3 (QUIC / MsQuic)");
+    } else {
+        lua_pushstring(L, "HTTP/1.1 (WinHTTP)");
+    }
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "isNative");
+    lua_pushboolean(L, 1);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "headers");
+    lua_newtable(L);
     lua_settable(L, -3);
 
     void* heap = GetProcessHeap();
@@ -1417,13 +1577,110 @@ static int checkRequest( lua_State *L )
     return 1;
 }
 
+// Отмена запроса на Windows
+static int cancelRequest( lua_State *L )
+{
+    if (lua_isnumber(L, 1)) {
+        int reqId = (int)lua_tointeger(L, 1);
+        RequestResult* res = GetAndRemoveResult(reqId);
+        if (res) {
+            void* heap = GetProcessHeap();
+            if (res->response_data) HeapFree(heap, 0, res->response_data);
+            HeapFree(heap, 0, res);
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+    }
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+// Метрики использования памяти на Windows
+typedef struct _PROCESS_MEMORY_COUNTERS_MIN {
+    unsigned long cb;
+    unsigned long PageFaultCount;
+    size_t PeakWorkingSetSize;
+    size_t WorkingSetSize;
+    size_t QuotaPeakPagedPoolUsage;
+    size_t QuotaPagedPoolUsage;
+    size_t QuotaPeakNonPagedPoolUsage;
+    size_t QuotaNonPagedPoolUsage;
+    size_t PagefileUsage;
+    size_t PeakPagefileUsage;
+} PROCESS_MEMORY_COUNTERS_MIN;
+
+typedef BOOL (WINAPI *PFN_GetProcessMemoryInfo)(HANDLE Process, PROCESS_MEMORY_COUNTERS_MIN* ppmc, DWORD cb);
+
+static int getMemoryStats( lua_State *L )
+{
+    size_t rssBytes = 0;
+    HMODULE hKernel = GetModuleHandleA("kernel32.dll");
+    if (hKernel) {
+        PFN_GetProcessMemoryInfo pfn = (PFN_GetProcessMemoryInfo)GetProcAddress(hKernel, "K32GetProcessMemoryInfo");
+        if (pfn) {
+            PROCESS_MEMORY_COUNTERS_MIN pmc;
+            pmc.cb = sizeof(pmc);
+            if (pfn(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+                rssBytes = pmc.WorkingSetSize;
+            }
+        }
+    }
+
+    double rssMB = (double)rssBytes / (1024.0 * 1024.0);
+
+    lua_newtable(L);
+
+    lua_pushnumber(L, (lua_Number)rssBytes);
+    lua_setfield(L, -2, "nativeRSSBytes");
+
+    lua_pushnumber(L, (lua_Number)rssMB);
+    lua_setfield(L, -2, "nativeRSSMB");
+
+    lua_pushinteger(L, 0);
+    lua_setfield(L, -2, "activeTasks");
+
+    lua_pushinteger(L, 0);
+    lua_setfield(L, -2, "totalCompleted");
+
+    lua_pushinteger(L, 0);
+    lua_setfield(L, -2, "totalFailed");
+
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "isHTTP3Configured");
+
+    lua_pushstring(L, "MsQuic + WinHTTP (Windows Native)");
+    lua_setfield(L, -2, "stackName");
+
+    return 1;
+}
+
+// Запуск сборки мусора
+static int collectGarbage( lua_State *L )
+{
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// Прокачка событий
+static int pumpEvents( lua_State *L )
+{
+    return 0;
+}
+
 // Функция открытия библиотеки
 static int Open( lua_State *L )
 {
     const luaL_Reg kVTable[] =
     {
+        { "request", initiateRequest },
         { "initiateRequest", initiateRequest },
         { "checkRequest", checkRequest },
+        { "cancel", cancelRequest },
+        { "getMemoryStats", getMemoryStats },
+        { "collectGarbage", collectGarbage },
+        { "pumpEvents", pumpEvents },
         { NULL, NULL }
     };
     luaL_openlib( L, "plugin.http3.native", kVTable, 0 );
@@ -1435,10 +1692,14 @@ static int Open( lua_State *L )
 int __stdcall DllMain(void* hModule, unsigned long ul_reason_for_call, void* lpReserved)
 {
     if (ul_reason_for_call == 1) { // DLL_PROCESS_ATTACH
-        // Инициализация при загрузке
+        if (!g_CritSecInitialized) {
+            InitializeCriticalSection(&g_CritSec);
+            g_CritSecInitialized = 1;
+        }
     } else if (ul_reason_for_call == 0) { // DLL_PROCESS_DETACH
         if (g_CritSecInitialized) {
-            DeleteCriticalSection((LPCRITICAL_SECTION)g_CritSecBuffer);
+            DeleteCriticalSection(&g_CritSec);
+            g_CritSecInitialized = 0;
         }
     }
     return 1;
