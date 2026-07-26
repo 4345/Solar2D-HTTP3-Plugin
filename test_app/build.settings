@@ -35,21 +35,12 @@ settings =
 		},
 	},
 
-	win32 =
-	{
-		preference =
-		{
-			singleInstance = true,
-		},
-	},
-
 	window =
 	{
 		defaultMode = "normal",
-		titleText = "Solar2D HTTP/3 Plugin Multiplatform Test Suite",
 		resizable = true,
-		minWidth = 360,
-		minHeight = 640,
+		minViewWidth = 360,
+		minViewHeight = 640,
 	},
 
 	plugins =
@@ -58,32 +49,7 @@ settings =
 		 ["plugin.http3"] =
         {
             publisherId = "ovh.azi",
-            supportedPlatforms =
-            {
-                -- Нативная сборка для Windows Desktop
-                win32 = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/win32/data.tgz" },
-
-                -- Нативная сборка для Windows Solar2D Simulator
-                ["win32-sim"] = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/win32-sim/data.tgz" },
-
-                -- Нативная сборка для Android устройств
-                android = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/android/data.tgz" },
-
-                -- Нативная сборка для iOS устройств (iPhone / iPad)
-                iphone = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/iphone/data.tgz" },
-
-                -- Нативная сборка для iOS Симулятора Xcode
-                ["iphone-sim"] = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/iphone-sim/data.tgz" },
-
-                -- Нативная сборка для macOS Desktop
-                macOS = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/macOS/data.tgz" },
-
-                -- Нативная сборка для macOS Solar2D Simulator
-                ["mac-sim"] = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/mac-sim/data.tgz" },
-
-                -- Универсальный Lua Fallback
-                lua = { url = "https://raw.githubusercontent.com/4345/Solar2D-HTTP3-Plugin/main/plugins/lua/data.tgz" },
-            }
+            
         },
 		
 	},

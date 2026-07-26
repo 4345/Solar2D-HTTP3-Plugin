@@ -138,9 +138,81 @@ typedef struct RequestResult {
 
 static RequestResult* g_ResultsList = NULL;
 
-// Добавление результата запроса в потокобезопасный список
+// Глобальные счетчики метрик активности задач для системных отчетов getMemoryStats
+static volatile long g_ActiveTasksCount = 0;
+static volatile long g_TotalCompletedCount = 0;
+static volatile long g_TotalFailedCount = 0;
+
+// Буфер отслеживания отмененных идентификаторов запросов для предотвращения утечек памяти
+#define MAX_CANCELLED_IDS 128
+static int g_CancelledIds[MAX_CANCELLED_IDS];
+static int g_CancelledIdsCount = 0;
+
+// Проверка, был ли запрос отменен со стороны Lua
+static int IsRequestCancelled(int id) {
+    for (int i = 0; i < g_CancelledIdsCount; i++) {
+        if (g_CancelledIds[i] == id) return 1;
+    }
+    return 0;
+}
+
+// Добавление идентификатора запроса в список отмененных
+static void AddCancelledId(int id) {
+    if (IsRequestCancelled(id)) return;
+    if (g_CancelledIdsCount < MAX_CANCELLED_IDS) {
+        g_CancelledIds[g_CancelledIdsCount++] = id;
+    } else {
+        // Сдвиг при переполнении очереди отмененных задач
+        for (int i = 0; i < MAX_CANCELLED_IDS - 1; i++) {
+            g_CancelledIds[i] = g_CancelledIds[i + 1];
+        }
+        g_CancelledIds[MAX_CANCELLED_IDS - 1] = id;
+    }
+}
+
+// Удаление идентификатора из списка отмененных
+static void RemoveCancelledId(int id) {
+    for (int i = 0; i < g_CancelledIdsCount; i++) {
+        if (g_CancelledIds[i] == id) {
+            for (int j = i; j < g_CancelledIdsCount - 1; j++) {
+                g_CancelledIds[j] = g_CancelledIds[j + 1];
+            }
+            g_CancelledIdsCount--;
+            break;
+        }
+    }
+}
+
+// Добавление результата запроса в потокобезопасный список с проверкой на отмену и очисткой старых результатов
 static void AddResult(int id, int is_error, int status, const char* data, int len, const char* transport) {
     EnterCriticalSection(&g_CritSec);
+
+    // Обновление метрик задач
+    if (g_ActiveTasksCount > 0) g_ActiveTasksCount--;
+    if (is_error) g_TotalFailedCount++;
+    else g_TotalCompletedCount++;
+
+    // Если запрос был отменен до завершения, отбрасываем результат для предотвращения утечки
+    if (IsRequestCancelled(id)) {
+        RemoveCancelledId(id);
+        LeaveCriticalSection(&g_CritSec);
+        return;
+    }
+
+    // Автоматическое удаление старых результатов из списка при превышении лимита (более 64 записей)
+    int count = 0;
+    RequestResult* curr = g_ResultsList;
+    while (curr) { count++; curr = curr->next; }
+    if (count >= 64 && g_ResultsList) {
+        RequestResult* prev = NULL;
+        curr = g_ResultsList;
+        while (curr->next) { prev = curr; curr = curr->next; }
+        if (prev) prev->next = NULL;
+        else g_ResultsList = NULL;
+        void* heap = GetProcessHeap();
+        if (curr->response_data) HeapFree(heap, 0, curr->response_data);
+        HeapFree(heap, 0, curr);
+    }
 
     void* heap = GetProcessHeap();
     RequestResult* res = (RequestResult*)HeapAlloc(heap, 0, sizeof(RequestResult));
@@ -305,17 +377,18 @@ typedef struct RaceContext {
     volatile long quicProgress;   // 1 если QUIC успешно прошёл handshake/connected
     volatile long tcpFinished;    // 0 = in-flight, 1 = success, 2 = failed
     volatile long tcpSuccess;     // 1 if TCP succeeded, 0 if failed
-    volatile long finishedCount;
+    volatile long refCount;       // Счетчик ссылок потоков на контекст гонки для атомарного освобождения памяти
 
     HANDLE quicDoneEvent;
 } RaceContext;
 
 enum RaceOutcome { RACE_SKIPPED, RACE_SUCCESS, RACE_FAILURE };
 
-static void CleanupRaceContext(RaceContext* race) {
+// Атомарное уменьшение счетчика ссылок и освобождение памяти контекста гонки при refCount == 0
+static void ReleaseRaceContext(RaceContext* race) {
     if (!race) return;
-    long total = __sync_add_and_fetch(&race->finishedCount, 1);
-    if (total == 2) {
+    long remaining = __sync_add_and_fetch(&race->refCount, -1);
+    if (remaining == 0) {
         void* heap = GetProcessHeap();
         if (race->quicDoneEvent) CloseHandle(race->quicDoneEvent);
         if (race->req) HeapFree(heap, 0, race->req);
@@ -323,6 +396,7 @@ static void CleanupRaceContext(RaceContext* race) {
     }
 }
 
+// Завершение гонки и фиксация результата. Публикует результат в AddResult без прямого освобождения race.
 static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
                         const char* data, int len, const char* transport, const char* errMsg) {
     if (outcome == RACE_SUCCESS) {
@@ -343,7 +417,6 @@ static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
             AddResult(race->req->id, 1, 0, msg, MyStrLen(msg), "Error");
         }
     }
-    CleanupRaceContext(race);
 }
 
 // ===========================================================================
@@ -969,9 +1042,11 @@ static long __cdecl ConnectionCallback(HQUIC Connection, void* Context, QUIC_CON
 
 static HMODULE g_hMsQuicModule = NULL;
 static QUIC_API_TABLE* g_MsQuicApiTable = NULL;
+static HQUIC g_MsQuicRegistration = NULL;
+static HQUIC g_MsQuicConfiguration = NULL;
 
 static QUIC_API_TABLE* GetGlobalMsQuicApi() {
-    if (g_MsQuicApiTable) return g_MsQuicApiTable;
+    if (g_MsQuicApiTable && g_MsQuicRegistration && g_MsQuicConfiguration) return g_MsQuicApiTable;
     EnterCriticalSection(&g_CritSec);
     if (!g_MsQuicApiTable) {
         g_hMsQuicModule = LoadLibraryA("msquic.dll");
@@ -996,9 +1071,37 @@ static QUIC_API_TABLE* GetGlobalMsQuicApi() {
             }
         }
     }
+
+    if (g_MsQuicApiTable && !g_MsQuicRegistration) {
+        QUIC_REGISTRATION_CONFIG regConfig = { "Solar2DHTTP3", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
+        g_MsQuicApiTable->RegistrationOpen(&regConfig, &g_MsQuicRegistration);
+    }
+
+    if (g_MsQuicRegistration && !g_MsQuicConfiguration) {
+        QUIC_BUFFER alpn; alpn.Length = 2; alpn.Buffer = (uint8_t*)"h3";
+        QUIC_SETTINGS settings;
+        memset(&settings, 0, sizeof(settings));
+        settings.PeerBidiStreamCount = 100;
+        settings.IsSet.PeerBidiStreamCount = 1;
+        settings.PeerUnidiStreamCount = 100;
+        settings.IsSet.PeerUnidiStreamCount = 1;
+        settings.IdleTimeoutMs = HTTP3_REQUEST_TIMEOUT_MS;
+        settings.IsSet.IdleTimeoutMs = 1;
+
+        if (g_MsQuicApiTable->ConfigurationOpen(g_MsQuicRegistration, &alpn, 1, &settings, sizeof(settings), NULL, &g_MsQuicConfiguration) == 0) {
+            QUIC_CREDENTIAL_CONFIG cred;
+            memset(&cred, 0, sizeof(cred));
+            cred.Type = QUIC_CREDENTIAL_TYPE_NONE;
+            cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+            g_MsQuicApiTable->ConfigurationLoadCredential(g_MsQuicConfiguration, &cred);
+        }
+    }
+
     LeaveCriticalSection(&g_CritSec);
     return g_MsQuicApiTable;
 }
+
+static unsigned long __stdcall Http1ThreadFunc(void* param);
 
 static unsigned long __stdcall Http3ThreadFunc(void* param) {
     RaceContext* race = (RaceContext*)param;
@@ -1008,13 +1111,27 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     char host[256]; int port = 0; char path[1024]; int secure = 0;
     if (!ParseUrl(req->url, host, sizeof(host), &port, path, sizeof(path), &secure) || !secure) {
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "HTTP/3 requires https URL");
+        // При несовместимости с HTTP/3 передаем выполнение в HTTP/1.1
+        __sync_add_and_fetch(&race->refCount, 1);
+        HANDLE hHttp1 = CreateThread(NULL, 64 * 1024, Http1ThreadFunc, race, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (hHttp1) CloseHandle(hHttp1);
+        else ReleaseRaceContext(race);
+
+        ReleaseRaceContext(race);
         return 0;
     }
 
     QUIC_API_TABLE* api = GetGlobalMsQuicApi();
-    if (!api) {
-        LogMsg("Http3ThreadFunc: msquic.dll / MsQuicOpenVersion недоступен");
+    if (!api || !g_MsQuicRegistration || !g_MsQuicConfiguration) {
+        LogMsg("Http3ThreadFunc: msquic.dll / MsQuicOpenVersion недоступен, фоллбэк на TCP HTTP/1.1");
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "msquic.dll not available");
+
+        __sync_add_and_fetch(&race->refCount, 1);
+        HANDLE hHttp1 = CreateThread(NULL, 64 * 1024, Http1ThreadFunc, race, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (hHttp1) CloseHandle(hHttp1);
+        else ReleaseRaceContext(race);
+
+        ReleaseRaceContext(race);
         return 0;
     }
 
@@ -1033,42 +1150,19 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     // HRESULT-семантика: успех — это (status >= 0), а не только 0.
 #define QUIC_OK(x) (((long)(x)) >= 0)
 
-    QUIC_REGISTRATION_CONFIG regConfig = { "Solar2DHTTP3", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
-    long st = api->RegistrationOpen(&regConfig, &state->registration);
-    LogHexVal("RegistrationOpen", st);
-
-    QUIC_BUFFER alpn; alpn.Length = 2; alpn.Buffer = (uint8_t*)"h3";
+    long st = api->ConnectionOpen(g_MsQuicRegistration, ConnectionCallback, state, &state->connection);
+    LogHexVal("ConnectionOpen", st);
 
     if (QUIC_OK(st)) {
-        QUIC_SETTINGS settings;
-        memset(&settings, 0, sizeof(settings));
-        settings.PeerBidiStreamCount = 100;
-        settings.IsSet.PeerBidiStreamCount = 1;
-        settings.PeerUnidiStreamCount = 100;
-        settings.IsSet.PeerUnidiStreamCount = 1;
-        settings.IdleTimeoutMs = HTTP3_REQUEST_TIMEOUT_MS;
-        settings.IsSet.IdleTimeoutMs = 1;
-
-        st = api->ConfigurationOpen(state->registration, &alpn, 1, &settings, sizeof(settings), NULL, &state->configuration);
-        LogHexVal("ConfigurationOpen", st);
+        st = api->ConnectionStart(state->connection, g_MsQuicConfiguration, QUIC_ADDRESS_FAMILY_UNSPEC, host, (uint16_t)port);
+        LogHexVal("ConnectionStart", st);
     }
-
-    if (QUIC_OK(st)) {
-        QUIC_CREDENTIAL_CONFIG cred;
-        memset(&cred, 0, sizeof(cred));
-        cred.Type = QUIC_CREDENTIAL_TYPE_NONE;
-        cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT; // Строгая проверка сертификата сервера (безопасность в приоритете)
-        st = api->ConfigurationLoadCredential(state->configuration, &cred);
-        LogHexVal("ConfigurationLoadCredential", st);
-    }
-
-    if (QUIC_OK(st)) { st = api->ConnectionOpen(state->registration, ConnectionCallback, state, &state->connection); LogHexVal("ConnectionOpen", st); }
-    if (QUIC_OK(st)) { st = api->ConnectionStart(state->connection, state->configuration, QUIC_ADDRESS_FAMILY_UNSPEC, host, (uint16_t)port); LogHexVal("ConnectionStart", st); }
 
     if (QUIC_OK(st)) {
         // Ожидаем завершения QUIC-запроса интервалами по 50 мс.
-        // Если вторичный TCP-поток уже победил по Happy Eyeballs, досрочно прерываем ожидание QUIC.
+        // Если через 250 мс QUIC не установил соединение, запускаем параллельный TCP поток (Happy Eyeballs v3).
         DWORD elapsed = 0;
+        BOOL tcpSpawned = FALSE;
         while (elapsed < HTTP3_REQUEST_TIMEOUT_MS) {
             DWORD waitRes = WaitForSingleObject(state->doneEvent, 50);
             if (waitRes == WAIT_OBJECT_0) break;
@@ -1103,41 +1197,15 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     //    ожидание колбэка SHUTDOWN_COMPLETE от MsQuic, гарантирующего,
     //    что все колбэки потоков/соединения завершены.
     // 2) ConnectionClose — автоматически закрывает все дочерние потоки.
-    //    Ручной вызов StreamClose перед ConnectionClose опасен:
-    //    MsQuic может повторно обратиться к уже закрытому хэндлу потока.
-    // 3) ConfigurationClose, RegistrationClose — в порядке от дочерних к корневым.
     if (state->connection) {
-        LogMsg("Http3ThreadFunc: ConnectionShutdown (SILENT)...");
         api->ConnectionShutdown(state->connection, QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0);
-        // Ожидаем SHUTDOWN_COMPLETE, чтобы все колбэки MsQuic гарантированно завершились
-        if (state->shutdownEvent && !state->shutdownComplete) {
-            LogMsg("Http3ThreadFunc: ожидание SHUTDOWN_COMPLETE от MsQuic...");
-            WaitForSingleObject(state->shutdownEvent, 2000);
-            LogMsg("Http3ThreadFunc: ожидание SHUTDOWN_COMPLETE завершено");
-        }
-        LogMsg("Http3ThreadFunc: ConnectionClose...");
         api->ConnectionClose(state->connection);
         state->connection = NULL;
-        LogMsg("Http3ThreadFunc: ConnectionClose завершён");
     }
-    // Потоки уже закрыты автоматически через ConnectionClose.
-    // Обнуляем указатели, чтобы не пытаться обращаться к ним.
     state->ctrlStream = NULL;
     state->encoderStream = NULL;
     state->decoderStream = NULL;
     state->requestStream = NULL;
-
-    if (state->configuration) {
-        LogMsg("Http3ThreadFunc: ConfigurationClose...");
-        api->ConfigurationClose(state->configuration);
-        state->configuration = NULL;
-    }
-    if (state->registration) {
-        LogMsg("Http3ThreadFunc: RegistrationClose...");
-        api->RegistrationClose(state->registration);
-        state->registration = NULL;
-        LogMsg("Http3ThreadFunc: RegistrationClose завершён");
-    }
 
     // Освобождение ресурсов Win32 и памяти кучи
     if (state->doneEvent) CloseHandle(state->doneEvent);
@@ -1148,15 +1216,30 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     HeapFree(heap, 0, state);
 
     LogMsg("Http3ThreadFunc: сессия MsQuic успешно завершена.");
-    CleanupRaceContext(race);
+    ReleaseRaceContext(race);
     return 0;
 }
 
 // ===========================================================================
-// WinHttp-клиент (Http1ThreadFunc) — надёжный TCP/HTTP1.1-путь гонки.
-// Логика не изменена относительно исходной реализации (кроме встраивания в
-// протокол гонки: ранний выход, если MsQuic уже победил, и отчёт через RaceFinish).
 // ===========================================================================
+// WinHttp-клиент (Http1ThreadFunc) — надёжный TCP/HTTP1.1-путь гонки.
+// ===========================================================================
+static HINTERNET g_hWinHttpSession = NULL;
+
+static HINTERNET GetGlobalWinHttpSession() {
+    if (g_hWinHttpSession) return g_hWinHttpSession;
+    EnterCriticalSection(&g_CritSec);
+    if (!g_hWinHttpSession) {
+        g_hWinHttpSession = WinHttpOpen(L"Solar2D-HTTP3-Plugin/1.0", 0, NULL, NULL, 0);
+        if (g_hWinHttpSession) {
+            WinHttpSetTimeouts(g_hWinHttpSession, HTTP3_REQUEST_TIMEOUT_MS, HTTP3_REQUEST_TIMEOUT_MS,
+                               HTTP3_REQUEST_TIMEOUT_MS, HTTP3_REQUEST_TIMEOUT_MS);
+        }
+    }
+    LeaveCriticalSection(&g_CritSec);
+    return g_hWinHttpSession;
+}
+
 static unsigned long __stdcall Http1ThreadFunc(void* param) {
     RaceContext* race = (RaceContext*)param;
     AsyncRequestContext* req = race->req;
@@ -1165,6 +1248,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     if (race->winnerAssigned) {
         LogMsg("Http1ThreadFunc: MsQuic/HTTP3 уже победил, пропускаем WinHttp");
         RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
+        ReleaseRaceContext(race);
         return 0;
     }
 
@@ -1175,27 +1259,24 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
 
     if (!ParseUrl(req->url, host, sizeof(host), &port, path, sizeof(path), &secure)) {
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "Невалидный URL");
+        ReleaseRaceContext(race);
         return 0;
     }
 
-    LogMsg("Http1ThreadFunc: WinHttpOpen...");
-    HINTERNET hSession = WinHttpOpen(L"Solar2D-HTTP3-Plugin/1.0", 0, NULL, NULL, 0);
+    HINTERNET hSession = GetGlobalWinHttpSession();
     if (!hSession) {
         LogMsg("Http1ThreadFunc: WinHttpOpen failed");
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttpOpen failed");
+        ReleaseRaceContext(race);
         return 0;
     }
-    // WinHttp не даёт единый дедлайн на весь запрос, только по фазам —
-    // ограничиваем каждую тем же значением (HTTP3_REQUEST_TIMEOUT_MS).
-    WinHttpSetTimeouts(hSession, HTTP3_REQUEST_TIMEOUT_MS, HTTP3_REQUEST_TIMEOUT_MS,
-                        HTTP3_REQUEST_TIMEOUT_MS, HTTP3_REQUEST_TIMEOUT_MS);
 
     wchar_t w_host[256];
     AnsiToWide(host, w_host, 256);
     HINTERNET hConnect = WinHttpConnect(hSession, w_host, (INTERNET_PORT)port, 0);
     if (!hConnect) {
-        WinHttpCloseHandle(hSession);
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttpConnect failed");
+        ReleaseRaceContext(race);
         return 0;
     }
 
@@ -1208,8 +1289,8 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, w_method, w_path, NULL, NULL, NULL, req_flags);
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttpOpenRequest failed");
+        ReleaseRaceContext(race);
         return 0;
     }
 
@@ -1223,8 +1304,8 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         LogMsg("Http1ThreadFunc: MsQuic/HTTP3 победил перед отправкой запроса, прерываем");
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
+        ReleaseRaceContext(race);
         return 0;
     }
 
@@ -1242,8 +1323,8 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     if (!send_res || !WinHttpReceiveResponse(hRequest, NULL)) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttp Send/Receive failed");
+        ReleaseRaceContext(race);
         return 0;
     }
 
@@ -1308,8 +1389,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     HeapFree(heap, 0, resp_buf);
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    CleanupRaceContext(race);
+    ReleaseRaceContext(race);
     return 0;
 }
 
@@ -1338,14 +1418,15 @@ static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
     // и НЕ завершилось успешно (quicSuccess == 1) за 250 мс, задействуем вторичный TCP
     if (race->quicSuccess == 0 && race->quicProgress == 0 && !race->winnerAssigned) {
         LogMsg("RaceAndRequestThreadFunc: QUIC не установил соединение (t=250ms или ошибка), запуск вторичной TCP попытки (Happy Eyeballs v3)...");
+        __sync_add_and_fetch(&race->refCount, 1);
         HANDLE hHttp1 = CreateThread(NULL, 0, Http1ThreadFunc, race, 0, NULL);
         if (hHttp1) CloseHandle(hHttp1);
+        else ReleaseRaceContext(race);
     } else {
-        // TCP запуск отменяется: QUIC успешно установил соединение/прогресс и победил
         LogMsg("RaceAndRequestThreadFunc: QUIC успешно установил соединение/прогресс, запуск TCP отменён");
-        CleanupRaceContext(race);
     }
 
+    ReleaseRaceContext(race);
     return 0;
 }
 
@@ -1353,9 +1434,6 @@ static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
 // Граница с Lua (Solar2D). Контракт этого модуля — plugin.http3.native:
 //   initiateRequest(url, params) -> число (ID) | nil     — старт гонки
 //   checkRequest(reqId)          -> таблица события | nil — опрос результата
-// Обёртка plugin_http3.lua различает Windows-протокол (число + опрос) от
-// push-протокола iOS/Android/macOS (true/false + прямой listener) по типу
-// значения, которое вернул initiateRequest — см. IMPLEMENTATION.md.
 // ===========================================================================
 
 // [Lua] native.initiateRequest( url, params ) -> returns reqId
@@ -1461,7 +1539,11 @@ static int initiateRequest( lua_State *L )
     race->req = req;
     race->quicDoneEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     race->winnerAssigned = 0;
-    race->finishedCount = 0;
+    race->refCount = 2; // 1 ссылка для RaceAndRequestThreadFunc, 1 для Http3ThreadFunc
+
+    EnterCriticalSection(&g_CritSec);
+    g_ActiveTasksCount++;
+    LeaveCriticalSection(&g_CritSec);
 
     LogMsg("initiateRequest: Создание фонового потока-оркестратора гонки...");
     unsigned long thread_id;
@@ -1472,6 +1554,9 @@ static int initiateRequest( lua_State *L )
         lua_pushinteger(L, req->id);
     } else {
         LogMsg("initiateRequest: Ошибка CreateThread!");
+        EnterCriticalSection(&g_CritSec);
+        if (g_ActiveTasksCount > 0) g_ActiveTasksCount--;
+        LeaveCriticalSection(&g_CritSec);
         if (race->quicDoneEvent) CloseHandle(race->quicDoneEvent);
         HeapFree(heap, 0, race);
         HeapFree(heap, 0, req);
@@ -1568,11 +1653,19 @@ static int cancelRequest( lua_State *L )
 {
     if (lua_isnumber(L, 1)) {
         int reqId = (int)lua_tointeger(L, 1);
+        EnterCriticalSection(&g_CritSec);
         RequestResult* res = GetAndRemoveResult(reqId);
         if (res) {
             void* heap = GetProcessHeap();
             if (res->response_data) HeapFree(heap, 0, res->response_data);
             HeapFree(heap, 0, res);
+            LeaveCriticalSection(&g_CritSec);
+            lua_pushboolean(L, 1);
+            return 1;
+        } else {
+            // Если результат ещё не добавлен, вносим ID в отменённые
+            AddCancelledId(reqId);
+            LeaveCriticalSection(&g_CritSec);
             lua_pushboolean(L, 1);
             return 1;
         }
@@ -1622,13 +1715,19 @@ static int getMemoryStats( lua_State *L )
     lua_pushnumber(L, (lua_Number)rssMB);
     lua_setfield(L, -2, "nativeRSSMB");
 
-    lua_pushinteger(L, 0);
+    EnterCriticalSection(&g_CritSec);
+    long activeTasks = g_ActiveTasksCount;
+    long totalCompleted = g_TotalCompletedCount;
+    long totalFailed = g_TotalFailedCount;
+    LeaveCriticalSection(&g_CritSec);
+
+    lua_pushinteger(L, activeTasks);
     lua_setfield(L, -2, "activeTasks");
 
-    lua_pushinteger(L, 0);
+    lua_pushinteger(L, totalCompleted);
     lua_setfield(L, -2, "totalCompleted");
 
-    lua_pushinteger(L, 0);
+    lua_pushinteger(L, totalFailed);
     lua_setfield(L, -2, "totalFailed");
 
     lua_pushboolean(L, 1);
@@ -1637,10 +1736,14 @@ static int getMemoryStats( lua_State *L )
     lua_pushstring(L, "MsQuic + WinHTTP (Windows Native)");
     lua_setfield(L, -2, "stackName");
 
+    // Метка времени и дата сборки бинарного нативного плагина C++
+    lua_pushstring(L, __DATE__ " " __TIME__);
+    lua_setfield(L, -2, "buildTimestamp");
+
     return 1;
 }
 
-// Принудительное освобождение всех результатов из кучи
+// Принудительное освобождение всех результатов из кучи и сброс TLS кэша сессий MsQuic
 static void FreeAllResults() {
     EnterCriticalSection(&g_CritSec);
     void* heap = GetProcessHeap();
@@ -1652,6 +1755,8 @@ static void FreeAllResults() {
         curr = next;
     }
     g_ResultsList = NULL;
+    g_CancelledIdsCount = 0;
+
     LeaveCriticalSection(&g_CritSec);
 }
 
@@ -1661,6 +1766,7 @@ static int collectGarbage( lua_State *L )
     FreeAllResults();
     lua_gc(L, LUA_GCCOLLECT, 0);
     lua_gc(L, LUA_GCCOLLECT, 0);
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1713,3 +1819,4 @@ CORONA_EXPORT int luaopen_plugin_http3_native( lua_State *L )
 {
     return Open( L );
 }
+

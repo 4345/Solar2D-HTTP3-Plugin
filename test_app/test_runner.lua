@@ -18,8 +18,8 @@ if not status or not http3 then
     os.exit(1)
 end
 
-local TOTAL_REQUESTS = 30
-local CONCURRENCY = 5
+local TOTAL_REQUESTS = 1000
+local CONCURRENCY = 10
 local TEST_URL = "https://cloudflare-quic.com"
 
 local completed = 0

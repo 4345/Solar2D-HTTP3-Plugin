@@ -59,29 +59,46 @@ local function loadNativeLibrary()
     -- Вариант 4: Динамическая подгрузка бинарных библиотек (.dylib / .so / .dll)
     if package and package.loadlib then
         local libPath = (system and system.pathForFile) and system.pathForFile("plugin/http3.dylib", system.ResourceDirectory) or "./plugin/http3.dylib"
+        local appData = (os.getenv and os.getenv("APPDATA")) or ""
+        local coronaPluginsDir = (appData ~= "") and (appData .. "\\Corona Labs\\Corona Simulator\\Plugins\\plugin_http3_native.dll") or ""
+        local solar2dSimDir = (appData ~= "") and (appData .. "\\Solar2DPlugins\\ovh.azi\\plugin.http3\\win32-sim\\plugin_http3_native.dll") or ""
+        local solar2dWinDir = (appData ~= "") and (appData .. "\\Solar2DPlugins\\ovh.azi\\plugin.http3\\win32\\plugin_http3_native.dll") or ""
 
-        local loaders = {
-            function() return package.loadlib(libPath, "luaopen_plugin_http3_native") end,
-            function() return package.loadlib(libPath, "luaopen_plugin_http3") end,
-            function() return package.loadlib("./plugin/http3.dylib", "luaopen_plugin_http3_native") end,
-            function() return package.loadlib("./plugin_http3.dylib", "luaopen_plugin_http3_native") end,
-            function() return package.loadlib("./plugin/http3.so", "luaopen_plugin_http3_native") end,
-            function() return package.loadlib("./plugin_http3_native.dll", "luaopen_plugin_http3_native") end,
-            function() return package.loadlib("./Release/plugin_http3_native.dll", "luaopen_plugin_http3_native") end,
+        local dllPaths = {
+            libPath,
+            "./plugin_http3_native.dll",
+            "../win32/Release/plugin_http3_native.dll",
+            "../plugins/win32-sim/plugin_http3_native.dll",
+            "../plugins/win32/plugin_http3_native.dll",
+            "./plugins/win32-sim/plugin_http3_native.dll",
+            "./Release/plugin_http3_native.dll",
+            coronaPluginsDir,
+            solar2dSimDir,
+            solar2dWinDir,
+            "./plugin/http3.dylib",
+            "./plugin_http3.dylib",
+            "./plugin/http3.so",
         }
 
-        for _, getLoader in ipairs(loaders) do
-            local loader = getLoader()
-            if loader then
-                local loadStatus, loadedLib = pcall(loader)
-                if loadStatus and type(loadedLib) == "table" and (loadedLib.request or loadedLib.initiateRequest) then
-                    nativeLib = loadedLib
-                    return nativeLib
+        for _, path in ipairs(dllPaths) do
+            if path and path ~= "" then
+                local loader = package.loadlib(path, "luaopen_plugin_http3_native")
+                if not loader then
+                    loader = package.loadlib(path, "luaopen_plugin_http3")
+                end
+                if loader then
+                    local loadStatus, loadedLib = pcall(loader)
+                    if loadStatus and type(loadedLib) == "table" and (loadedLib.request or loadedLib.initiateRequest) then
+                        print("[HTTP3 Lua] Успешно загружен нативный модуль C++ DLL:", path)
+                        nativeLib = loadedLib
+                        return nativeLib
+                    end
                 end
             end
         end
     end
 
+    print("[HTTP3 Lua] ОШИБКА: Нативный модуль C++ DLL не найден ни в одной из директорий!")
     return nil
 end
 
@@ -161,14 +178,12 @@ function M.request(url, method, listener, params)
         }
         requestParams.timeout = timeout
 
-        print("[HTTP3 Lua] Инициализация вызова нативного модуля:", url, httpMethod)
         local result = nil
         if cLib.request then
             result = cLib.request(url, httpMethod, wrapperListener, requestParams)
         elseif cLib.initiateRequest then
             result = cLib.initiateRequest(url, nativeParams)
         end
-        print("[HTTP3 Lua] Нативный модуль вернул reqId:", tostring(result))
 
         -- Возвращаемое значение плагина: всегда числовой requestId
         if type(result) == "number" and result > 0 then
@@ -195,6 +210,9 @@ function M.request(url, method, listener, params)
                                 Runtime:removeEventListener("enterFrame", activeListeners[reqId])
                             end
                             activeListeners[reqId] = nil
+                            if cLib and cLib.cancel then
+                                cLib.cancel(reqId)
+                            end
                             wrapperListener({ isError = true, error = "Request Timeout", reason = "Timeout" })
                         end
                     end
@@ -271,7 +289,8 @@ function M.getMemoryStats()
         totalCompleted = 0,
         totalFailed = 0,
         isHTTP3Configured = false,
-        stackName = "Solar2D network.request (Fallback)"
+        stackName = "Solar2D network.request (Fallback)",
+        buildTimestamp = "Fallback (Pure Lua)"
     }
 end
 
