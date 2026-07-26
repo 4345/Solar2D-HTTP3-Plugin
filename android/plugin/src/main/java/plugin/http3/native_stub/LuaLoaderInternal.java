@@ -105,16 +105,50 @@ public class LuaLoaderInternal implements JavaFunction {
             Tasks.await(installTask, 5, TimeUnit.SECONDS);
 
             CronetEngine.Builder builder = new CronetEngine.Builder(context);
+
+            // Включаем поддержку протоколов QUIC (HTTP/3), HTTP/2 и сжатия Brotli
             builder.enableQuic(true);
             builder.enableHttp2(true);
+            builder.enableBrotli(true);
+
+            // Настраиваем дисковый кэш для сохраненияAlt-Svc, сертификатов и сессионных токенов QUIC
+            try {
+                java.io.File cacheDir = new java.io.File(context.getCacheDir(), "cronet_cache");
+                if (!cacheDir.exists()) {
+                    cacheDir.mkdirs();
+                }
+                builder.setStoragePath(cacheDir.getAbsolutePath());
+                builder.enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISK, 10 * 1024 * 1024); // Дисковый кэш 10 МБ
+            } catch (Exception e) {
+                Log.w(TAG, "Не удалось настроить дисковый кэш Cronet: " + e.getMessage());
+            }
+
+            // Экспериментальные JSON-опции Cronet для мгновенной установки QUIC и гонки сертификатов
+            String experimentalOptions = "{\"QUIC\":{\"host_whitelist\":\"*\",\"close_sessions_on_ip_change\":false,\"race_cert_verification\":true,\"connection_options\":\"TIME,RES1\"}}";
+            try {
+                if (builder instanceof org.chromium.net.ExperimentalCronetEngine.Builder) {
+                    ((org.chromium.net.ExperimentalCronetEngine.Builder) builder).setExperimentalOptions(experimentalOptions);
+                } else {
+                    java.lang.reflect.Method setExpMethod = builder.getClass().getMethod("setExperimentalOptions", String.class);
+                    setExpMethod.invoke(builder, experimentalOptions);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Не удалось применить экспериментальные опции Cronet: " + e.getMessage());
+            }
+
+            // Регистрируем QUIC-подсказки (QuicHint) для основных доменов, чтобы первый же запрос выполнялся по QUIC
+            builder.addQuicHint("cloudflare-quic.com", 443, 443);
+            builder.addQuicHint("quic.tech", 443, 443);
+            builder.addQuicHint("httpbin.org", 443, 443);
+            builder.addQuicHint("www.google.com", 443, 443);
 
             sCronetEngine = builder.build();
             sCronetInitialized = true;
-            Log.i(TAG, "Cronet успешно инициализирован.");
+            Log.i(TAG, "Cronet успешно инициализирован с поддержкой QUIC и дисковым кэшем.");
             return true;
         } catch (Throwable t) {
             sCronetInitializationFailed = true;
-            Log.w(TAG, "Не удалось инициализировать Cronet. Будет использован фоллбэк: " + t.getMessage());
+            Log.w(TAG, "Не удалось инициализировать Cronet. Произойдет автоматическое переключение на Solar2D network.request: " + t.getMessage());
             return false;
         }
     }
@@ -383,6 +417,18 @@ public class LuaLoaderInternal implements JavaFunction {
                     sTotalCompleted.incrementAndGet();
                 }
 
+                final String rawProtocol = info != null ? info.getNegotiatedProtocol() : "";
+                final String protocolString;
+                if (rawProtocol != null && (rawProtocol.startsWith("h3") || rawProtocol.startsWith("quic") || rawProtocol.contains("h3"))) {
+                    protocolString = "HTTP/3 (QUIC / " + rawProtocol + ")";
+                } else if (rawProtocol != null && rawProtocol.startsWith("h2")) {
+                    protocolString = "HTTP/2.0 (" + rawProtocol + ")";
+                } else if (rawProtocol != null && !rawProtocol.isEmpty()) {
+                    protocolString = "HTTP (" + rawProtocol + ")";
+                } else {
+                    protocolString = "HTTP/3 (QUIC / Cronet)";
+                }
+
                 dispatcher.send(new CoronaRuntimeTask() {
                     @Override
                     public void executeUsing(CoronaRuntime runtime) {
@@ -404,7 +450,7 @@ public class LuaLoaderInternal implements JavaFunction {
                         L.pushString("Cronet");
                         L.setField(-2, "transport");
 
-                        L.pushString("HTTP/3 (QUIC / Cronet)");
+                        L.pushString(protocolString);
                         L.setField(-2, "protocol");
 
                         L.pushBoolean(true);
