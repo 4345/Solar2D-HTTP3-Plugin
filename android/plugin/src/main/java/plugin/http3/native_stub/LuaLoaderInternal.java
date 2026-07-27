@@ -15,6 +15,7 @@ import com.google.android.gms.net.CronetProviderInstaller;
 import com.google.android.gms.tasks.Task;
 import com.google.android.gms.tasks.Tasks;
 import org.chromium.net.CronetEngine;
+import org.chromium.net.CronetProvider;
 import org.chromium.net.UrlRequest;
 import org.chromium.net.UrlResponseInfo;
 import org.chromium.net.CronetException;
@@ -94,37 +95,60 @@ public class LuaLoaderInternal implements JavaFunction {
         if (sCronetInitialized) {
             return true;
         }
-        if (sCronetInitializationFailed) {
-            return false;
-        }
 
         try {
-            Log.i(TAG, "Попытка инициализации Cronet через Google Play Services...");
+            Log.i(TAG, "Инициализация Cronet через Google Play Services...");
 
-            Task<Void> installTask = CronetProviderInstaller.installProvider(context);
-            Tasks.await(installTask, 5, TimeUnit.SECONDS);
+            CronetEngine.Builder builder = null;
 
-            CronetEngine.Builder builder = new CronetEngine.Builder(context);
+            // 1. Проверяем наличие уже доступных и включенных провайдеров Cronet на устройстве
+            try {
+                List<CronetProvider> providers = CronetProvider.getAllProviders(context);
+                for (CronetProvider provider : providers) {
+                    if (provider.isEnabled()) {
+                        builder = provider.createBuilder();
+                        Log.i(TAG, "Успешно найден доступный CronetProvider: " + provider.getName() + " (v" + provider.getVersion() + ")");
+                        break;
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Не удалось опросить список CronetProvider: " + t.getMessage());
+            }
+
+            // 2. Если готовый провайдер еще не был инициализирован, запрашиваем установку Cronet через Google Play Services
+            if (builder == null) {
+                try {
+                    Task<Void> installTask = CronetProviderInstaller.installProvider(context);
+                    Tasks.await(installTask, 5, TimeUnit.SECONDS);
+                    builder = new CronetEngine.Builder(context);
+                } catch (Throwable t) {
+                    Log.w(TAG, "Установка CronetProvider через Google Play Services завершилась с ошибкой: " + t.getMessage());
+                    return false;
+                }
+            }
 
             // Включаем поддержку протоколов QUIC (HTTP/3), HTTP/2 и сжатия Brotli
             builder.enableQuic(true);
             builder.enableHttp2(true);
             builder.enableBrotli(true);
 
-            // Настраиваем дисковый кэш для сохраненияAlt-Svc, сертификатов и сессионных токенов QUIC
+            // Настраиваем дисковый кэш исключительно для сохранения Alt-Svc, сертификатов и сессионных токенов QUIC.
+            // Использование HTTP_CACHE_DISK_NO_HTTP гарантирует, что сам HTTP-контент ответов НЕ кэшируется на диске,
+            // и каждый сетевой запрос из приложения отправляется в реальную сеть.
             try {
                 java.io.File cacheDir = new java.io.File(context.getCacheDir(), "cronet_cache");
                 if (!cacheDir.exists()) {
                     cacheDir.mkdirs();
                 }
                 builder.setStoragePath(cacheDir.getAbsolutePath());
-                builder.enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISK, 10 * 1024 * 1024); // Дисковый кэш 10 МБ
+                builder.enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISK_NO_HTTP, 10 * 1024 * 1024); // Дисковый кэш QUIC-метаданных 10 МБ
             } catch (Exception e) {
                 Log.w(TAG, "Не удалось настроить дисковый кэш Cronet: " + e.getMessage());
             }
 
-            // Экспериментальные JSON-опции Cronet для мгновенной установки QUIC и гонки сертификатов
-            String experimentalOptions = "{\"QUIC\":{\"host_whitelist\":\"*\",\"close_sessions_on_ip_change\":false,\"race_cert_verification\":true,\"connection_options\":\"TIME,RES1\"}}";
+            // Экспериментальные JSON-опции Cronet для параллельной проверки сертификатов (race_cert_verification)
+            // Без блокировки миграции IP при смене сетевых сокетов на устройстве Android
+            String experimentalOptions = "{\"QUIC\":{\"race_cert_verification\":true}}";
             try {
                 if (builder instanceof org.chromium.net.ExperimentalCronetEngine.Builder) {
                     ((org.chromium.net.ExperimentalCronetEngine.Builder) builder).setExperimentalOptions(experimentalOptions);
@@ -144,11 +168,10 @@ public class LuaLoaderInternal implements JavaFunction {
 
             sCronetEngine = builder.build();
             sCronetInitialized = true;
-            Log.i(TAG, "Cronet успешно инициализирован с поддержкой QUIC и дисковым кэшем.");
+            Log.i(TAG, "Cronet успешно инициализирован через Google Play Services.");
             return true;
         } catch (Throwable t) {
-            sCronetInitializationFailed = true;
-            Log.w(TAG, "Не удалось инициализировать Cronet. Произойдет автоматическое переключение на Solar2D network.request: " + t.getMessage());
+            Log.w(TAG, "Не удалось инициализировать Cronet: " + t.getMessage());
             return false;
         }
     }
@@ -176,61 +199,91 @@ public class LuaLoaderInternal implements JavaFunction {
         public int invoke(LuaState L) {
             String url = L.checkString(1);
 
-            if (L.type(2) != LuaType.TABLE) {
-                throw new IllegalArgumentException("HTTP3 Error: Параметр 2 должен быть таблицей");
-            }
-
-            // Метод запроса (по умолчанию GET)
-            L.getField(2, "method");
             String method = "GET";
-            if (L.type(-1) == LuaType.STRING) {
-                method = L.toString(-1);
-            }
-            L.pop(1);
-
-            // Таймаут запроса (по умолчанию 3.0 секунды)
-            L.getField(2, "timeout");
-            double timeoutSec = 3.0;
-            if (L.type(-1) == LuaType.NUMBER) {
-                timeoutSec = L.toNumber(-1);
-            }
-            L.pop(1);
-            if (timeoutSec <= 0) {
-                timeoutSec = 3.0;
-            }
-
-            // Тело запроса (body)
-            L.getField(2, "body");
+            double timeoutSec = 15.0;
             String body = null;
-            if (L.type(-1) == LuaType.STRING) {
-                body = L.toString(-1);
-            }
-            L.pop(1);
-
-            // Заголовки
             Map<String, String> headers = new HashMap<>();
-            L.getField(2, "headers");
-            if (L.type(-1) == LuaType.TABLE) {
-                L.pushNil();
-                while (L.next(-2)) {
-                    String key = L.toString(-2);
-                    String val = L.toString(-1);
-                    if (key != null && val != null) {
-                        headers.put(key, val);
-                    }
-                    L.pop(1);
+            int listenerIdx = 0;
+            int tableIdx = 0;
+
+            // Гибкое определение сигнатуры вызова (cLib.request или cLib.initiateRequest)
+            if (L.type(2) == LuaType.STRING) {
+                // Сигнатура cLib.request(url, method, listener [, params])
+                method = L.toString(2);
+                listenerIdx = 3;
+                if (L.type(4) == LuaType.TABLE) {
+                    tableIdx = 4;
+                }
+            } else if (L.type(2) == LuaType.TABLE) {
+                // Сигнатура cLib.initiateRequest(url, params)
+                tableIdx = 2;
+                if (CoronaLua.isListener(L, 3, "http3")) {
+                    listenerIdx = 3;
+                }
+            } else if (CoronaLua.isListener(L, 2, "http3")) {
+                // Сигнатура cLib.request(url, listener [, params])
+                listenerIdx = 2;
+                if (L.type(3) == LuaType.TABLE) {
+                    tableIdx = 3;
                 }
             }
-            L.pop(1);
 
-            // Lua-слушатель (listener)
-            L.getField(2, "listener");
-            if (!CoronaLua.isListener(L, -1, "http3")) {
+            // Извлечение параметров из таблицы, если она была передана
+            if (tableIdx > 0) {
+                L.getField(tableIdx, "method");
+                if (L.type(-1) == LuaType.STRING) {
+                    method = L.toString(-1);
+                }
                 L.pop(1);
-                throw new IllegalArgumentException("HTTP3 Error: listener должен быть функцией или валидным объектом слушателя");
+
+                L.getField(tableIdx, "timeout");
+                if (L.type(-1) == LuaType.NUMBER) {
+                    timeoutSec = L.toNumber(-1);
+                }
+                L.pop(1);
+
+                L.getField(tableIdx, "body");
+                if (L.type(-1) == LuaType.STRING) {
+                    body = L.toString(-1);
+                }
+                L.pop(1);
+
+                L.getField(tableIdx, "headers");
+                if (L.type(-1) == LuaType.TABLE) {
+                    L.pushNil();
+                    while (L.next(-2)) {
+                        String key = L.toString(-2);
+                        String val = L.toString(-1);
+                        if (key != null && val != null) {
+                            headers.put(key, val);
+                        }
+                        L.pop(1);
+                    }
+                }
+                L.pop(1);
+
+                if (listenerIdx == 0) {
+                    L.getField(tableIdx, "listener");
+                    if (CoronaLua.isListener(L, -1, "http3")) {
+                        listenerIdx = L.getTop();
+                    } else {
+                        L.pop(1);
+                    }
+                }
             }
-            final int listenerRef = CoronaLua.newRef(L, -1);
-            L.pop(1);
+
+            if (timeoutSec <= 0) {
+                timeoutSec = 15.0;
+            }
+
+            // Валидация слушателя событий Lua
+            if (listenerIdx == 0 || !CoronaLua.isListener(L, listenerIdx, "http3")) {
+                throw new IllegalArgumentException("HTTP3 Error: listener должен быть функцией или объектом слушателя");
+            }
+            final int listenerRef = CoronaLua.newRef(L, listenerIdx);
+            if (listenerIdx == L.getTop() && tableIdx > 0) {
+                L.pop(1);
+            }
 
             final Context context = CoronaEnvironment.getApplicationContext();
             if (context == null) {
