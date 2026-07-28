@@ -18,8 +18,8 @@ android {
 
 dependencies {
     implementation ':Corona@aar'
-    // Зависимость от Cronet во время компиляции (не пакуется в AAR)
-    compileOnly 'com.google.android.gms:play-services-cronet:18.0.1'
+    // Зависимость от Cronet из Google Play Services (динамическая загрузка Cronet из ОС)
+    implementation 'com.google.android.gms:play-services-cronet:18.0.1'
 }
 
 def buildDirectory = getLayout().getBuildDirectory().asFile.get()

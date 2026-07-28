@@ -146,9 +146,14 @@ public class LuaLoaderInternal implements JavaFunction {
                 Log.w(TAG, "Не удалось настроить дисковый кэш Cronet: " + e.getMessage());
             }
 
-            // Экспериментальные JSON-опции Cronet для параллельной проверки сертификатов (race_cert_verification)
-            // Без блокировки миграции IP при смене сетевых сокетов на устройстве Android
-            String experimentalOptions = "{\"QUIC\":{\"race_cert_verification\":true}}";
+            // Экспериментальные JSON-опции Cronet:
+            // 1. race_cert_verification: параллельная проверка сертификатов для ускорения рукопожатия.
+            // 2. delay_tcp_race: старт QUIC на 250 мс раньше TCP в соответствии с Happy Eyeballs v3.
+            // 3. initial_delay_for_broken_alternative_service_seconds: 10 секунд задержки перед повторной попыткой использовать H3/QUIC после сбоя.
+            //    При блокировке UDP Cronet временно отключает HTTP/3 на 10 секунд, а после восстановления пропуска UDP
+            //    по истечении 10 секунд новые сессии автоматически возвращаются на транспорт HTTP/3.
+            // 4. connection_id_length: длина идентификатора соединения QUIC (Connection ID) 4 байта.
+            String experimentalOptions = "{\"QUIC\":{\"race_cert_verification\":true,\"delay_tcp_race\":true,\"initial_delay_for_broken_alternative_service_seconds\":10,\"connection_id_length\":4}}";
             try {
                 if (builder instanceof org.chromium.net.ExperimentalCronetEngine.Builder) {
                     ((org.chromium.net.ExperimentalCronetEngine.Builder) builder).setExperimentalOptions(experimentalOptions);
@@ -159,12 +164,6 @@ public class LuaLoaderInternal implements JavaFunction {
             } catch (Exception e) {
                 Log.w(TAG, "Не удалось применить экспериментальные опции Cronet: " + e.getMessage());
             }
-
-            // Регистрируем QUIC-подсказки (QuicHint) для основных доменов, чтобы первый же запрос выполнялся по QUIC
-            builder.addQuicHint("cloudflare-quic.com", 443, 443);
-            builder.addQuicHint("quic.tech", 443, 443);
-            builder.addQuicHint("httpbin.org", 443, 443);
-            builder.addQuicHint("www.google.com", 443, 443);
 
             sCronetEngine = builder.build();
             sCronetInitialized = true;
