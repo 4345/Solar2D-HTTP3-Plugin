@@ -14,8 +14,8 @@
 | :--- | :--- | :--- | :--- |
 | **Windows (`win32`, `win32-sim`)** | C++ / **MsQuic (Microsoft QUIC)** & **WinHTTP** | Polling / `enterFrame` | Независимый C++ модуль без привязки к тяжелому C Runtime CRT. Высокая пропускная способность при минимизации накладных расходов памяти. |
 | **iOS / macOS (`iphone`, `macOS`)** | Objective-C++ / **`NSURLSession`** & **`Network.framework`** | Async Push Callback | Принудительное включение протокола HTTP/3 через `assumesHTTP3Capable = YES`. Безопасная работа с памятью через прямые C-буферы `malloc`/`free`, полностью исключающая утечки Foundation ARC. |
-| **Android (`android`)** | Kotlin / Java / **Cronet** / **OkHttp3** | JNI Event Dispatcher | Полная поддержка мобильных архитектур (ARM64, x86_64). Оптимизированная передача бинарных данных через Lua Bridge. |
-| **Fallback (Универсальный)** | Lua / **`network.request`** | Solar2D Network Loop | Прозрачный автоматический переход на встроенный стек Solar2D `network.request`, если нативная библиотека недоступна на целевом устройстве или сервере. |
+| **Android (`android`)** | Java / **Cronet** | JNI Event Dispatcher | Полная поддержка мобильных архитектур (ARM64, x86_64). Тело и ответ передаются через Lua Bridge как `byte[]` — двоичные данные не портятся. Kotlin не используется. |
+| **Fallback (Универсальный)** | Lua / **`network.request`** | Solar2D Network Loop | Прозрачный автоматический переход на встроенный стек Solar2D `network.request`, если нативная библиотека недоступна на целевом устройстве или сервере. Параметры запроса передаются в него ПОЛНОСТЬЮ, включая `bodyType`. |
 
 ### 2. Производительность и контроль памяти
 
@@ -24,11 +24,65 @@
 - **Мониторинг физической памяти**: Нативный метод `http3.getMemoryStats()` возвращает реальное объём занимаемой физической памяти (RSS) и количество активных сетевых задач.
 - **Принудительное очищение памяти**: Нативный вызов `http3.collectGarbage()` безопасно очищает задействованные пулы памяти и запускает сборщик мусора Lua.
 
+### 3. Двоичные данные и `bodyType`
+
+Плагин пригоден для двоичных протоколов (msgpack, protobuf, сырые файлы): тело
+запроса и тело ответа проходят **по длине**, а не как C-строка и не через
+перекодировку.
+
+| Платформа | Тело запроса | Тело ответа |
+| :--- | :--- | :--- |
+| Windows / Apple | `lua_tolstring` | `lua_pushlstring` |
+| Android | `LuaState.toByteArray` → `UploadDataProviders.create(byte[])` | `ByteArrayOutputStream.toByteArray` → `LuaState.pushString(byte[])` |
+| Fallback | `network.request` с исходным `bodyType` | строка Lua, как её отдаёт Solar2D |
+
+Параметр `bodyType = "binary"` поддерживается в том же смысле, что и в
+`network.request`. На нативных путях он не требуется — там байты и так идут как
+байты, — но в режиме отката передаётся дальше, потому что без него Solar2D
+отправляет тело как текст в UTF-8 и портит двоичные данные.
+
+Через откат передаются и остальные параметры `network.request`, а не только
+`headers`/`body`/`timeout`: `bodyType`, `progress`, `response`,
+`handleRedirects`.
+
+**Умолчание `timeout` — 3 секунды** (в `network.request` — 30). Такого ожидания
+не требует ни один сценарий, а в iOS/macOS 3 секунды приняты стандартом для
+HTTP/3.
+
+### 4. Имя нативного модуля: `plugin.http3.ntv`
+
+Solar2D ищет загрузчик по имени требуемого модуля: `require("a.b.c")` → класс
+`a.b.c.LuaLoader`. Прежнее имя `plugin.http3.native` заставляло держать
+загрузчик на Kotlin: пакет с сегментом `native` javac собрать не может, это
+ключевое слово Java. Ради Kotlin в AAR подмешивался весь `kotlin-stdlib`, и
+сборка приложения, где Kotlin уже есть, падала:
+
+```
+Duplicate class kotlin.ArrayIntrinsicsKt found in modules
+kotlin-stdlib-2.1.0.jar and plugin-release.aar
+```
+
+Пакет переименован в `plugin.http3.ntv`, загрузчик переписан на Java, Kotlin из
+плагина убран целиком. AAR похудел с 1 609 344 до 19 385 байт.
+
+Lua-модуль ищет нативный модуль по списку имён: сначала `plugin.http3.ntv`,
+затем прежнее `plugin.http3.native` — готовые бинарники Apple и Windows
+экспортируют `luaopen_plugin_http3_native`. Точки входа
+`luaopen_plugin_http3_ntv` в их исходники добавлены, так что после пересборки
+запасное имя можно будет убрать.
+
 ---
 
 ## 🛠 Подключение плагина в конфигурации приложений (`build.settings`)
 
-Для подключения плагина в ваших проектах Solar2D укажите прямые ссылки на опубликованные архивы плагина из данного репозитория в файле `build.settings`:
+Есть два способа: по прямым ссылкам и локально. **Ссылки работают только если
+репозиторий открыт.** Solar2D скачивает эти архивы обычным HTTPS-запросом, без
+заголовка `Authorization`, и учётные данные git ему недоступны: они лежат в
+хранилище под ключом `git:https://github.com` и достаются только тем, кто умеет
+протокол git-credential. Для закрытого репозитория загрузчик получит 404 и
+уронит сборку на всех платформах сразу.
+
+### Способ 1 — прямые ссылки (репозиторий должен быть открыт)
 
 ```lua
 -- build.settings
@@ -79,6 +133,41 @@ settings =
 }
 ```
 
+### Способ 2 — локально (годится и для закрытого репозитория)
+
+Разложите содержимое каталога `plugins/` в локальное хранилище плагинов
+Solar2D, сохранив имена платформ:
+
+```
+%APPDATA%\Solar2DPlugins\ovh.azi\plugin.http3\<платформа>\
+```
+
+(на macOS — `~/Library/Application Support/Solar2DPlugins/ovh.azi/plugin.http3/`).
+В каждой платформенной папке должен лежать её `data.tgz` — сборка берёт именно
+архив, а не файлы рядом с ним. После этого объявление сокращается до одной
+строки, без `supportedPlatforms`:
+
+```lua
+plugins =
+{
+    ["plugin.http3"] = { publisherId = "ovh.azi" },
+},
+```
+
+Локальное хранилище имеет приоритет над сетевым каталогом плагинов, поэтому так
+подключается и рабочая копия при разработке. Именно этот способ используют
+`test_app/build.settings` и `Apple/build.settings` в этом репозитории.
+
+Android-сборку плагина туда кладёт задача Gradle:
+
+```
+cd android && ./gradlew :plugin:deployToLocalSolar2DRepo
+```
+
+Она деплоит в каталог `plugin.http3.ntv` (по имени нативного модуля) — если
+приложение объявляет `plugin.http3`, скопируйте `data.tgz` оттуда в
+`plugin.http3/android`.
+
 ---
 
 ## 💻 Инициализация и использование API в Lua
@@ -126,6 +215,30 @@ end, {
     timeout = 10.0
 })
 ```
+
+### 2а. Двоичное тело (`bodyType = "binary"`)
+
+```lua
+local http3 = require("plugin.http3")
+
+local headers = { ["Content-Type"] = "application/msgpack" }
+
+http3.request("https://example.com/api", "POST", function(event)
+    if not event.isError then
+        -- event.response — сырые байты, длина сохранена, декодировать можно как есть
+        local otvet = msgpack.decode(event.response)
+    end
+end, {
+    headers = headers,
+    body = msgpack.encode({ action = "ping" }),
+    bodyType = "binary",   -- как в network.request
+    timeout = 3,
+})
+```
+
+Байты не портятся ни на одной платформе, включая режим отката: `bodyType`
+передаётся в `network.request` дальше. Подробнее — раздел «Двоичные данные и
+`bodyType`» выше.
 
 ### 3. Отмена выполняющегося запроса (`cancel`)
 
@@ -186,7 +299,10 @@ Solar2D-HTTP3-Plugin/
 │   ├── msquic.h
 │   └── msquic_winuser.h
 ├── win32/                          # Проект Visual Studio (Plugin.sln, Plugin.vcxproj, C++ исходники)
-├── android/                        # Проект Android Studio и Gradle (Kotlin/Java нативный слой)
+├── android/                        # Проект Android Studio и Gradle (нативный слой на Java, без Kotlin)
+│   └── plugin/src/main/java/plugin/http3/
+│       ├── ntv/LuaLoader.java      # Загрузчик, который ищет Solar2D по имени модуля
+│       └── native_stub/LuaLoaderInternal.java  # Реализация на Cronet
 ├── Apple/                          # Скрипты сборки Xcode, Makefile и deployLocal.sh
 ├── test_app/                       # Универсальное тестовое Solar2D-приложение
 │   ├── main.lua                    # Дашборд проверки метрик памяти и пачек из 50 запросов
