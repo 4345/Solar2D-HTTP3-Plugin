@@ -37,7 +37,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 // ===========================================================================
-// Унифицированная реализация плагина plugin.http3.native для Android.
+// Унифицированная реализация плагина plugin.http3.ntv для Android.
+// (Класс лежит в пакете native_stub, а загрузчик, который ищет Solar2D, —
+//  в plugin.http3.ntv: сегмент native ключевое слово Java, см. LuaLoader.java.)
 //
 // АРХИТЕКТУРА И ВОЗМОЖНОСТИ:
 //   - Использует движок Chromium Cronet через Google Play Services.
@@ -69,7 +71,7 @@ public class LuaLoaderInternal implements JavaFunction {
     private static final AtomicLong sTotalFailed = new AtomicLong(0);
 
     /**
-     * Точка входа в плагин при require "plugin.http3.native".
+     * Точка входа в плагин при require "plugin.http3.ntv".
      */
     @Override
     public int invoke(LuaState L) {
@@ -80,7 +82,9 @@ public class LuaLoaderInternal implements JavaFunction {
             new GetMemoryStatsWrapper(),
             new CollectGarbageWrapper()
         };
-        L.register("plugin.http3.native", luaFunctions);
+        // Имя модуля должно совпадать с тем, по которому его требуют:
+        // require("plugin.http3.ntv") -> класс plugin.http3.ntv.LuaLoader -> сюда.
+        L.register("plugin.http3.ntv", luaFunctions);
         return 1;
     }
 
