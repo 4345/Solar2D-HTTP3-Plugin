@@ -5,7 +5,8 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.6.21")
+        // kotlin-gradle-plugin убран вместе с самим Kotlin: единственный
+        // Kotlin-класс плагина был переписан на Java, см. plugin/build.gradle.
         classpath("com.android.tools.build:gradle:8.13.2")
         classpath("com.beust:klaxon:5.5")
     }

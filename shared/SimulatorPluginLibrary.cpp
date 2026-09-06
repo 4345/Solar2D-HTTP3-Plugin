@@ -1820,3 +1820,15 @@ CORONA_EXPORT int luaopen_plugin_http3_native( lua_State *L )
     return Open( L );
 }
 
+// Новое имя модуля — plugin.http3.ntv, отсюда и символ. Прежнее оставлено выше
+// для совместимости с уже собранными приложениями.
+// Переименование понадобилось из-за Android: там Solar2D ищет загрузчик по
+// имени модуля (require("a.b.c") -> класс a.b.c.LuaLoader), а пакет с сегментом
+// native javac собрать не может — это ключевое слово Java. Ради обхода
+// загрузчик держали на Kotlin и тащили в AAR весь kotlin-stdlib, что роняло
+// сборку приложений дубликатами классов. Имя ntv снимает причину целиком.
+CORONA_EXPORT int luaopen_plugin_http3_ntv( lua_State *L )
+{
+    return Open( L );
+}
+

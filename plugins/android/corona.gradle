@@ -1,6 +1,12 @@
 dependencies {
     // Подключаем Cronet из Google Play Services динамически
     implementation 'com.google.android.gms:play-services-cronet:18.0.1'
+
+    // kotlin-stdlib здесь НЕ нужен: Kotlin из плагина убран целиком.
+    // Он держался ради одного класса-переходника, потому что имя пакета
+    // содержало слово native — ключевое слово Java. Пакет переименован в
+    // plugin.http3.ntv, загрузчик переписан на Java. Ни зависимости, ни
+    // "толстого" AAR, ни дубликатов классов в приложении больше нет.
 }
 
 android {

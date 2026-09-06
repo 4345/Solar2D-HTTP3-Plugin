@@ -573,6 +573,18 @@ CORONA_EXPORT int luaopen_plugin_http3_native(lua_State *L) {
     return luaopen_plugin_http3(L);
 }
 
+// Новое имя модуля — plugin.http3.ntv (прежнее оставлено выше для
+// совместимости). Понадобилось из-за Android: пакет с сегментом native javac
+// собрать не может, это ключевое слово Java, и ради обхода загрузчик держали
+// на Kotlin, подмешивая в AAR весь kotlin-stdlib.
+CORONA_EXPORT int luaopen_plugin_http3_ntv(lua_State *L) {
+    return luaopen_plugin_http3(L);
+}
+
+CORONA_EXPORT int CoronaPluginLuaLoad_plugin_http3_ntv(lua_State *L) {
+    return luaopen_plugin_http3(L);
+}
+
 CORONA_EXPORT int luaopen_http3(lua_State *L) {
     return luaopen_plugin_http3(L);
 }

@@ -1,5 +1,7 @@
+// Kotlin из плагина убран: загрузчик переписан на Java, пакет переименован из
+// plugin.http3.native в plugin.http3.ntv (native — ключевое слово Java, ради
+// обхода которого Kotlin и держали). См. plugin/http3/ntv/LuaLoader.java.
 apply plugin: 'com.android.library'
-apply plugin: 'kotlin-android'
 
 android {
     compileSdk 35
@@ -24,68 +26,26 @@ dependencies {
 
 def buildDirectory = getLayout().getBuildDirectory().asFile.get()
 
-// Solar2D просто извлекает classes.jar из AAR и подмешивает его в общий dex
-// приложения — он не выполняет полноценное разрешение Gradle-зависимостей,
-// как это сделал бы настоящий multi-module проект. AAR-файлы никогда не
-// встраивают в себя transitive-зависимости (это стандартное поведение
-// Android-тулчейна), поэтому kotlin-stdlib, нужный классу LuaLoader.kt,
-// в classes.jar не попадает. Итог — NoClassDefFoundError на
-// kotlin.jvm.internal.Intrinsics при первом же обращении к плагину на
-// реальном устройстве, ещё до того, как выполнится хоть одна строчка
-// логики плагина (Cronet/QUIC и т.д.). Раньше отсутствие kotlin-stdlib
-// маскировалось тем, что до рантайм-вызова просто не доходили при
-// разработке на Simulator (win32-sim не собирает Android-байткод вообще).
-// Чтобы android/plugin/build.gradle:deployToLocalSolar2DRepo пакетировал
-// рабочий плагин, нужно вручную подмешать классы kotlin-stdlib в
-// classes.jar — т.е. собрать "fat"-AAR.
-def fatAarUnpackedDir = "$buildDirectory/fatAar/unpacked"
-def fatAarOutputDir = "$buildDirectory/fatAar/output"
-
-tasks.register("unpackReleaseAar", Copy) {
-    group "Solar2Dev"
-    dependsOn assembleRelease
-    from(zipTree("$buildDirectory/outputs/aar/${project.name}-release.aar"))
-    into fatAarUnpackedDir
-    exclude "classes.jar"
-}
-
-tasks.register("mergeKotlinStdlibIntoClasses", Jar) {
-    group "Solar2Dev"
-    dependsOn assembleRelease
-
-    def kotlinStdlibJars = configurations.releaseRuntimeClasspath.filter {
-        it.name.startsWith("kotlin-stdlib")
-    }
-
-    archiveFileName = "classes.jar"
-    destinationDirectory = file(fatAarUnpackedDir)
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-
-    from {
-        zipTree(zipTree("$buildDirectory/outputs/aar/${project.name}-release.aar").matching { include 'classes.jar' }.singleFile)
-    }
-    from({ kotlinStdlibJars.collect { zipTree(it) } }) {
-        exclude "META-INF/**"
-    }
-}
-
-tasks.register("packFatAar", Zip) {
-    group "Solar2Dev"
-    dependsOn unpackReleaseAar, mergeKotlinStdlibIntoClasses
-    from(fatAarUnpackedDir)
-    archiveFileName = "${project.name}-release.aar"
-    destinationDirectory = file(fatAarOutputDir)
-}
+// "ТОЛСТЫЙ" AAR БОЛЬШЕ НЕ НУЖЕН И УДАЛЁН.
+// Он существовал ровно затем, чтобы протащить kotlin-stdlib внутрь classes.jar:
+// Solar2D извлекает из AAR только classes.jar и не разрешает его transitive-
+// зависимости, поэтому Kotlin-загрузчик падал бы с NoClassDefFoundError на
+// kotlin.jvm.internal.Intrinsics. А в приложении, где Kotlin УЖЕ есть, вшитый
+// stdlib ронял сборку на дубликатах классов.
+// Теперь Kotlin в плагине не используется вовсе (загрузчик на Java, пакет
+// plugin.http3.ntv), поэтому обе беды отпали вместе с их причиной.
 
 tasks.register("extractPluginJar") {
     group "Solar2Dev"
-    dependsOn mergeKotlinStdlibIntoClasses
+    dependsOn assembleRelease
     doLast {
         copy {
-            from "$fatAarUnpackedDir/classes.jar"
+            from zipTree("$buildDirectory/outputs/aar/${project.name}-release.aar").matching {
+                include "classes.jar"
+            }
             into "$buildDirectory/outputs/"
             // Имя пакета плагина в Solar2D
-            String packageName = "plugin.http3.native"
+            String packageName = "plugin.http3.ntv"
             rename "classes.jar", "${packageName}.jar"
         }
     }
@@ -99,13 +59,13 @@ def providerId = 'ovh.azi'
 tasks.register("deployToLocalSolar2DRepo", Tar) {
     group "Solar2Dev"
 
-    dependsOn packFatAar
+    dependsOn assembleRelease
 
     File pluginManifestFile = file("src/main/AndroidManifest.xml")
     String manifestContents = pluginManifestFile.text
     def pluginManifestXml = new XmlSlurper().parseText(manifestContents)
     // Имя пакета плагина в Solar2D
-    String packageName = "plugin.http3.native"
+    String packageName = "plugin.http3.ntv"
 
     compression = Compression.GZIP
     archiveFileName = "data.tgz"
@@ -119,9 +79,9 @@ tasks.register("deployToLocalSolar2DRepo", Tar) {
     def dst = file("$rootS2DP/Solar2DPlugins/$providerId/$packageName/android")
     destinationDirectory = dst
 
-    // Упаковываем собранную "fat"-AAR (classes.jar уже содержит kotlin-stdlib)
+    // Упаковываем обычную AAR: посторонних классов в ней нет, только сам плагин.
     into("/") {
-        from(fatAarOutputDir)
+        from("$buildDirectory/outputs/aar")
         include("${project.name}-release.aar")
     }
     // Добавляем файл corona.gradle с динамическими зависимостями в архив

@@ -200,7 +200,13 @@ public class LuaLoaderInternal implements JavaFunction {
 
             String method = "GET";
             double timeoutSec = 15.0;
-            String body = null;
+            // Тело — БАЙТЫ, а не String. Строка Java хранит символы, и любой
+            // перевод байт<->String идёт через кодировку: msgpack и прочие
+            // двоичные данные не являются валидным UTF-8, невалидные
+            // последовательности заменяются на U+FFFD, и тело портится молча.
+            // JNLua в Corona даёт байтовые методы (toByteArray/pushString(byte[])),
+            // они и работают по длине, а не до первого нулевого байта.
+            byte[] body = null;
             Map<String, String> headers = new HashMap<>();
             int listenerIdx = 0;
             int tableIdx = 0;
@@ -243,7 +249,10 @@ public class LuaLoaderInternal implements JavaFunction {
 
                 L.getField(tableIdx, "body");
                 if (L.type(-1) == LuaType.STRING) {
-                    body = L.toString(-1);
+                    // toByteArray, а не toString: строка Lua — это байты с
+                    // длиной, и переводить их в java.lang.String нельзя (см.
+                    // коммент у объявления body выше).
+                    body = L.toByteArray(-1);
                 }
                 L.pop(1);
 
@@ -301,7 +310,7 @@ public class LuaLoaderInternal implements JavaFunction {
             final int requestId = sRequestIdCounter.getAndIncrement();
 
             final String finalMethod = method;
-            final String finalBody = body;
+            final byte[] finalBody = body;
             final Map<String, String> finalHeaders = headers;
             final double finalTimeout = timeoutSec;
 
@@ -419,7 +428,7 @@ public class LuaLoaderInternal implements JavaFunction {
                                            final String url,
                                            final String method,
                                            final Map<String, String> headers,
-                                           final String body,
+                                           final byte[] body,
                                            final double timeoutSec,
                                            final CoronaRuntimeTaskDispatcher dispatcher,
                                            final int listenerRef) {
@@ -457,7 +466,10 @@ public class LuaLoaderInternal implements JavaFunction {
                 sActiveRequestsMap.remove(requestId);
 
                 final int statusCode = info.getHttpStatusCode();
-                final String responseString = responseStream.toString();
+                // toByteArray, а не toString(): ответ сервера тоже двоичный
+                // (msgpack), и toString() без кодировки разобрал бы его как
+                // UTF-8, заменив невалидные байты на U+FFFD.
+                final byte[] responseBytes = responseStream.toByteArray();
                 final int bytesTotal = responseStream.size();
                 final boolean isError = statusCode >= 400;
                 final String reason = isError ? "HTTP Error " + statusCode : null;
@@ -493,7 +505,9 @@ public class LuaLoaderInternal implements JavaFunction {
                         L.pushBoolean(isError);
                         L.setField(-2, "isError");
 
-                        L.pushString(responseString);
+                        // pushString(byte[]) кладёт строку Lua ПО ДЛИНЕ — байты
+                        // доходят до Lua ровно такими, какими пришли от сервера.
+                        L.pushString(responseBytes);
                         L.setField(-2, "response");
 
                         L.pushInteger(bytesTotal);
@@ -569,9 +583,11 @@ public class LuaLoaderInternal implements JavaFunction {
             requestBuilder.addHeader(entry.getKey(), entry.getValue());
         }
 
-        if (body != null && body.length() > 0) {
+        if (body != null && body.length > 0) {
+            // Байты уходят как есть, без getBytes(): перекодировка в UTF-8
+            // испортила бы двоичное тело (msgpack).
             requestBuilder.setUploadDataProvider(
-                org.chromium.net.UploadDataProviders.create(body.getBytes()),
+                org.chromium.net.UploadDataProviders.create(body),
                 sExecutor
             );
         }
