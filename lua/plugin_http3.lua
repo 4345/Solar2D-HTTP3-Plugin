@@ -157,16 +157,15 @@ function M.request(url, method, listener, params)
     -- Умолчание таймаута — 3 секунды, и это НЕ описка и не наследие: у
     -- network.request в Solar2D стоит 30с, но сценария, где такое ожидание
     -- осмысленно, попросту нет — даже спутниковый канал отвечает много раньше.
-    -- В iOS/macOS 3 секунды приняты стандартом для HTTP/3. Столько же принято и
-    -- в проекте, который этим плагином пользуется. Не возвращать к 30с.
+    -- В iOS/macOS 3 секунды приняты стандартом для HTTP/3. Не возвращать к 30с.
     local timeout = requestParams.timeout or 3.0
 
     -- ПАРАМЕТРЫ ОТКАТА собираем ПОЛНОСТЬЮ, копией исходной таблицы, а не из
     -- трёх избранных полей. У network.request их больше: bodyType, progress,
     -- response, handleRedirects. Пересборка из headers/body/timeout молча
     -- теряла остальные, и опаснее всего терялся bodyType="binary" — без него
-    -- Solar2D отправляет тело как текст UTF-8 и портит двоичные данные
-    -- (msgpack игрового протокола).
+    -- Solar2D отправляет тело как текст UTF-8 и портит любые двоичные данные
+    -- (MessagePack, Protobuf, сырые файлы).
     local function params_dlya_otkata()
         local p = {}
         for k, v in pairs(requestParams) do p[k] = v end

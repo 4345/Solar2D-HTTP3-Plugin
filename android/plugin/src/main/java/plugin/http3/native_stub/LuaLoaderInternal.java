@@ -201,9 +201,10 @@ public class LuaLoaderInternal implements JavaFunction {
             String method = "GET";
             double timeoutSec = 15.0;
             // Тело — БАЙТЫ, а не String. Строка Java хранит символы, и любой
-            // перевод байт<->String идёт через кодировку: msgpack и прочие
-            // двоичные данные не являются валидным UTF-8, невалидные
-            // последовательности заменяются на U+FFFD, и тело портится молча.
+            // перевод байт<->String идёт через кодировку: двоичные данные
+            // (MessagePack, Protobuf, сырые файлы) валидным UTF-8 не являются,
+            // невалидные последовательности заменяются на U+FFFD, и тело
+            // портится молча.
             // JNLua в Corona даёт байтовые методы (toByteArray/pushString(byte[])),
             // они и работают по длине, а не до первого нулевого байта.
             byte[] body = null;
@@ -466,8 +467,8 @@ public class LuaLoaderInternal implements JavaFunction {
                 sActiveRequestsMap.remove(requestId);
 
                 final int statusCode = info.getHttpStatusCode();
-                // toByteArray, а не toString(): ответ сервера тоже двоичный
-                // (msgpack), и toString() без кодировки разобрал бы его как
+                // toByteArray, а не toString(): ответ сервера тоже может быть
+                // двоичным, и toString() без кодировки разобрал бы его как
                 // UTF-8, заменив невалидные байты на U+FFFD.
                 final byte[] responseBytes = responseStream.toByteArray();
                 final int bytesTotal = responseStream.size();
@@ -585,7 +586,7 @@ public class LuaLoaderInternal implements JavaFunction {
 
         if (body != null && body.length > 0) {
             // Байты уходят как есть, без getBytes(): перекодировка в UTF-8
-            // испортила бы двоичное тело (msgpack).
+            // испортила бы двоичное тело.
             requestBuilder.setUploadDataProvider(
                 org.chromium.net.UploadDataProviders.create(body),
                 sExecutor
