@@ -1,7 +1,7 @@
 -------------------------------------------------------------------------------
 -- test_app/main.lua
 -- Модификация приложения test_app без UI (Headless-режим)
--- Выполняет периодические HTTP/3 запросы к https://example.com/ и выводит
+-- Выполняет периодические HTTP/3 запросы к https://cloudflare-quic.com и выводит
 -- результаты работы протокола и транспорта в консоль (adb logcat).
 -------------------------------------------------------------------------------
 
@@ -22,7 +22,7 @@ if not status or not http3 then
 end
 
 -- Целевой URL тестового сервера HTTP/3
-local TEST_URL = "https://example.com/"
+local TEST_URL = "https://cloudflare-quic.com"
 
 
 

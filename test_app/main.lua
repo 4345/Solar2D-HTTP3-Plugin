@@ -29,7 +29,7 @@ if not status or not http3 then
     }
 end
 
-local TEST_URL = "https://example.com/"
+local TEST_URL = "https://cloudflare-quic.com"
 
 -- Переменные метрик приложения
 local activeRequestsCount = 0
