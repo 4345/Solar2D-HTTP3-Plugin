@@ -1511,6 +1511,10 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
 // действительно застрял, а не просто не успел поздороваться.
 // ===========================================================================
 #define HAPPY_EYEBALLS_DELAY_MS 700
+// Второе окно — на ОТВЕТ по уже установленному соединению QUIC (см. ниже, в
+// оркестраторе). Соединение может встать молча после подключения, и без этого
+// окна запрос ждал бы полного таймаута в 3с, оставшись без запасного пути.
+#define HAPPY_EYEBALLS_OTVET_MS 800
 static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
     RaceContext* race = (RaceContext*)param;
     LogMsg("RaceAndRequestThreadFunc: старт гонки MsQuic/HTTP3 vs WinHttp/HTTP1.1 по draft-ietf-happy-happyeyeballs-v3");
@@ -1536,8 +1540,43 @@ static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
         HANDLE hHttp1 = CreateThread(NULL, 0, Http1ThreadFunc, race, 0, NULL);
         if (hHttp1) CloseHandle(hHttp1);
         else ReleaseRaceContext(race);
+    } else if (race->quicSuccess == 0 && !race->winnerAssigned) {
+        // СОЕДИНИЛСЯ — ЕЩЁ НЕ ЗНАЧИТ ОТВЕТИЛ. Раньше здесь запуск TCP просто
+        // отменялся, стоило QUIC завершить рукопожатие. И этого хватало, пока
+        // окно было 250мс: TCP успевал стартовать ДО рукопожатия и страховал
+        // собой. Когда окно подняли выше стоимости рукопожатия, страховка
+        // исчезла — а соединение может встать молча уже ПОСЛЕ подключения.
+        // В журнале это выглядело так: SETTINGS и HEADERS отправлены, дальше
+        // тишина до самого таймаута в 3с, потом откат через network.request, и
+        // запрос обошёлся игроку в 5.1с (отчёт пользователя).
+        //
+        // Поэтому у гонки два окна: первое на СОЕДИНЕНИЕ (выше), второе на
+        // ОТВЕТ. Не пришёл ответ и во втором — вторичная попытка всё равно
+        // уходит, как и задумано в Happy Eyeballs.
+        //
+        // Ждём опросом, а не на quicDoneEvent: событие взводится с ручным
+        // сбросом ещё на рукопожатии и остаётся взведённым, так что ожидание
+        // на нём вернулось бы мгновенно.
+        LogMsg("RaceAndRequestThreadFunc: QUIC соединился, ждём ответа (второе окно)");
+        DWORD zhdali = 0;
+        while (zhdali < HAPPY_EYEBALLS_OTVET_MS
+               && !race->winnerAssigned
+               && race->quicSuccess == 0
+               && race->quicFinished == 0) {
+            Sleep(50);
+            zhdali += 50;
+        }
+        if (race->quicSuccess == 0 && race->quicFinished == 0 && !race->winnerAssigned) {
+            LogMsg("RaceAndRequestThreadFunc: ответа по QUIC нет, запуск вторичной TCP попытки");
+            __sync_add_and_fetch(&race->refCount, 1);
+            HANDLE hHttp1 = CreateThread(NULL, 0, Http1ThreadFunc, race, 0, NULL);
+            if (hHttp1) CloseHandle(hHttp1);
+            else ReleaseRaceContext(race);
+        } else {
+            LogMsg("RaceAndRequestThreadFunc: ответ по QUIC получен, запуск TCP отменён");
+        }
     } else {
-        LogMsg("RaceAndRequestThreadFunc: QUIC успешно установил соединение/прогресс, запуск TCP отменён");
+        LogMsg("RaceAndRequestThreadFunc: QUIC уже завершился, запуск TCP отменён");
     }
 
     ReleaseRaceContext(race);
