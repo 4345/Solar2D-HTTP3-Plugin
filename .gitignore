@@ -34,3 +34,6 @@ android/plugin/build/reports/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Промежуточные файлы сборки стенда (в игру не идут)
+win32/Stend/
