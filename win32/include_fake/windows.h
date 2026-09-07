@@ -172,6 +172,7 @@ __declspec(dllimport) void __stdcall OutputDebugStringA(const char* lpOutputStri
    дозапись и узнать номер потока — без номера гонку Happy Eyeballs по журналу
    не разобрать, записи двух потоков перемешаны. */
 __declspec(dllimport) DWORD __stdcall GetCurrentThreadId(void);
+__declspec(dllimport) DWORD __stdcall GetTempPathA(DWORD nBufferLength, char* lpBuffer);
 __declspec(dllimport) HANDLE __stdcall CreateFileA(const char* lpFileName, DWORD dwDesiredAccess,
                                                    DWORD dwShareMode, void* lpSecurityAttributes,
                                                    DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,

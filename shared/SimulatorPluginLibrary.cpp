@@ -163,7 +163,22 @@ static void LogWrite(const char* msg, const char* dopolnenie, unsigned long chis
     if (s_chislom) { LogPutStr(" = ", stroka, &pos, sizeof(stroka)); LogPutNum(chislo, stroka, &pos, sizeof(stroka)); }
     LogPutStr("\r\n", stroka, &pos, sizeof(stroka));
 
-    HANDLE h = CreateFileA("plugin_http3.log", FILE_APPEND_DATA,
+    // ПУТЬ АБСОЛЮТНЫЙ, во временный каталог пользователя. Относительное имя
+    // не годится: файл лёг бы в рабочий каталог процесса, а у Solar2D
+    // Simulator это каталог установки в Program Files — туда запись запрещена,
+    // CreateFileA молча возвращает INVALID_HANDLE_VALUE, и журнала нет вовсе
+    // (ровно это и наблюдалось: игра шла, а файл не появлялся нигде).
+    char put[320];
+    DWORD n = GetTempPathA(sizeof(put) - 24, put);
+    if (n == 0 || n > sizeof(put) - 24) { n = 0; }
+    {
+        const char* imya = "plugin_http3.log";
+        DWORD i = 0;
+        while (imya[i] && n + i < sizeof(put) - 1) { put[n + i] = imya[i]; i++; }
+        put[n + i] = 0;
+    }
+
+    HANDLE h = CreateFileA(put, FILE_APPEND_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h != INVALID_HANDLE_VALUE) {
