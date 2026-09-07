@@ -1,3 +1,4 @@
 LIBRARY plugin_http3_native.dll
 EXPORTS
     luaopen_plugin_http3_native
+    luaopen_plugin_http3_ntv
