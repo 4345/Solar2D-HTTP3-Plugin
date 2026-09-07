@@ -135,7 +135,7 @@ static int MyAtoi(const char* s) {
 //
 // Стандартной библиотеки здесь нет (см. шапку файла), поэтому число в строку
 // переводим сами.
-#define HTTP3_LOG_ENABLED 1   // 0 — собрать без журнала (боевая сборка)
+#define HTTP3_LOG_ENABLED 0   // 0 — собрать без журнала (боевая сборка)
 
 #if HTTP3_LOG_ENABLED
 static void LogPutNum(unsigned long v, char* out, int* pos, int cap) {
