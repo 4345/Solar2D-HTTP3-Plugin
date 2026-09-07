@@ -178,7 +178,14 @@ function M.request(url, method, listener, params)
     -- Обёртка над слушателем для перехвата ошибок транспорта и аннотации события
     local function wrapperListener(event)
         if event and event.isError and event.reason == "NATIVE_TRANSPORT_FAILED" then
-            print("HTTP3: Нативный транспорт недоступен. Автоматическое переключение на Solar2D network.request.")
+            -- Адрес и настоящая причина: нативный слой кладёт текст ошибки в
+            -- response (см. RaceFinish/AddResult), а reason всегда одна и та же
+            -- константа. Без адреса сообщение не говорит даже того, какой запрос
+            -- сорвался, и по журналу игры разобрать нечего.
+            local prichina = event.response
+            if prichina == nil or prichina == "" then prichina = "причина не передана" end
+            print("HTTP3: Нативный транспорт недоступен (" .. tostring(url) .. "): "
+                  .. tostring(prichina) .. ". Переключение на Solar2D network.request.")
             if network and network.request then
                 network.request(url, httpMethod, callbackListener, params_dlya_otkata())
             end

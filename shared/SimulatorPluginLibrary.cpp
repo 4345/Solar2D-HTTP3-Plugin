@@ -448,6 +448,12 @@ typedef struct AsyncRequestContext {
     int body_len;
     char headers[2048];
     int secure;
+    // Таймаут ЭТОГО запроса, мс. Раньше нативный слой брал зашитые 3 секунды, а
+    // параметр timeout из Lua не читал вовсе. Длинный опрос игры просит 5 с, при
+    // том что сервер держит ответ ~2 с (10 итераций по 200 мс, events.go), и
+    // опрос, изредка вылезавший за 3 секунды, получал отказ транспорта на ровном
+    // месте - в игре это выглядело как "нативный транспорт недоступен".
+    int timeout_ms;
 } AsyncRequestContext;
 
 // ===========================================================================
@@ -1425,7 +1431,7 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
         // Если через 250 мс QUIC не установил соединение, запускаем параллельный TCP поток (Happy Eyeballs v3).
         DWORD elapsed = 0;
         BOOL tcpSpawned = FALSE;
-        while (elapsed < HTTP3_REQUEST_TIMEOUT_MS) {
+        while (elapsed < (DWORD)req->timeout_ms) {
             DWORD waitRes = WaitForSingleObject(state->doneEvent, 50);
             if (waitRes == WAIT_OBJECT_0) break;
             elapsed += 50;
@@ -1582,6 +1588,13 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         ReleaseRaceContext(race);
         return 0;
     }
+
+    // Таймауты у сессии WinHTTP общие на все запросы, поэтому таймаут ЭТОГО
+    // запроса ставим на его собственный дескриптор. Иначе запасной TCP-путь
+    // продолжал бы жить по зашитым 3 секундам и обрывал бы длинный опрос,
+    // которому Lua разрешил 5 секунд.
+    WinHttpSetTimeouts(hRequest, req->timeout_ms, req->timeout_ms,
+                       req->timeout_ms, req->timeout_ms);
 
     wchar_t w_headers[1024];
     w_headers[0] = L'\0';
@@ -1816,6 +1829,7 @@ static int initiateRequest( lua_State *L )
     req->method[0] = 'G'; req->method[1] = 'E'; req->method[2] = 'T'; req->method[3] = '\0';
     req->body_len = 0;
     req->headers[0] = '\0';
+    req->timeout_ms = HTTP3_REQUEST_TIMEOUT_MS;   // умолчание, ниже перекроется параметром
     req->id = g_NextRequestId++;
 
     if (lua_isstring(L, 2)) {
@@ -1845,6 +1859,17 @@ static int initiateRequest( lua_State *L )
                 m_idx++;
             }
             req->method[m_idx] = '\0';
+        }
+        lua_pop(L, 1);
+
+        // timeout задаётся в СЕКУНДАХ, как в network.request, и может быть дробным.
+        lua_getfield(L, tbl_idx, "timeout");
+        if (lua_isnumber(L, -1)) {
+            double sek = lua_tonumber(L, -1);
+            if (sek > 0.0) {
+                if (sek > 120.0) sek = 120.0;   // защита от бессмысленных значений
+                req->timeout_ms = (int)(sek * 1000.0);
+            }
         }
         lua_pop(L, 1);
 
