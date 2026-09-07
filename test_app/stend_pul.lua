@@ -69,10 +69,13 @@ local function pustit()
             end
         end
     end, { timeout = 5, body = telo, bodyType = telo and "binary" or nil,
-           headers = { ["X-App-Req-Auth"] = "0000000000000000",
-                       ["Content-Type"] = "text/plain",
-                       ["X-App-Ts"] = "0000000000000000000",
-                       ["X-App-Context-Id"] = "0000000000000000" } })
+           -- Несколько заголовков среднего размера: кадр заголовков должен быть
+           -- заметно длиннее короткого тела - именно на таком соотношении и
+           -- вылезала ошибка длины второго буфера.
+           headers = { ["Content-Type"] = "text/plain",
+                       ["X-Stend-Token"] = "0123456789abcdef",
+                       ["X-Stend-Marker"] = "1234567890123456789",
+                       ["X-Stend-Context"] = "0123456789abcdef" } })
 end
 
 local predel = os.clock() + 300
