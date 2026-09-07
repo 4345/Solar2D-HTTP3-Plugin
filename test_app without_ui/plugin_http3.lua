@@ -33,41 +33,46 @@ local function loadNativeLibrary()
         return nativeLib
     end
 
+    -- ИМЕНА НАТИВНОГО МОДУЛЯ, по порядку предпочтения.
+    --   plugin.http3.ntv    — новое имя. Solar2D ищет загрузчик по имени
+    --     модуля (require("a.b.c") -> класс a.b.c.LuaLoader), а пакет с
+    --     сегментом native javac собрать не может: это ключевое слово Java.
+    --     Из-за него загрузчик держали на Kotlin и тащили в AAR весь
+    --     kotlin-stdlib. Пакет переименован, Kotlin убран.
+    --   plugin.http3.native — прежнее имя. ОСТАВЛЕНО НАМЕРЕННО: готовые
+    --     бинарники Apple и Windows экспортируют luaopen_plugin_http3_native,
+    --     и до их пересборки модуль доступен только под этим именем. Когда
+    --     они будут пересобраны с alias luaopen_plugin_http3_ntv (он уже
+    --     добавлен в shared/SimulatorPluginLibrary.cpp и .mm), эту строку
+    --     можно убрать.
+    --   plugin.http3        — базовое имя, как отдаёт Apple-сборка.
+    local imena = { "plugin.http3.ntv", "plugin.http3.native", "plugin.http3" }
+
     -- Вариант 1: Зарегистрированный предзагрузчик в package.preload
-    if package and package.preload and package.preload["plugin.http3.native"] then
-        local status, lib = pcall(package.preload["plugin.http3.native"])
-        if status and type(lib) == "table" and (lib.request or lib.initiateRequest) then
+    if package and package.preload then
+        for i = 1, #imena do
+            local preload = package.preload[imena[i]]
+            if preload then
+                local status, lib = pcall(preload)
+                if status and type(lib) == "table" and (lib.request or lib.initiateRequest) then
+                    nativeLib = lib
+                    return nativeLib
+                end
+            end
+        end
+    end
+
+    -- Вариант 2: Прямой require нативного модуля
+    for i = 1, #imena do
+        local status, lib = pcall(require, imena[i])
+        if status and type(lib) == "table" and (lib.request or lib.initiateRequest) and lib ~= M then
             nativeLib = lib
             return nativeLib
         end
     end
 
-    -- Вариант 1.5: Прямой require по расширенному имени модуля
-    local status, lib = pcall(require, "plugin_http3_native")
-    if status and type(lib) == "table" and (lib.request or lib.initiateRequest) and lib ~= M then
-        nativeLib = lib
-        return nativeLib
-    end
-
-    -- Вариант 2: Прямой require нативного C-модуля по стандартному имени
-    status, lib = pcall(require, "plugin.http3.native")
-    if status and type(lib) == "table" and (lib.request or lib.initiateRequest) and lib ~= M then
-        nativeLib = lib
-        return nativeLib
-    end
-
-    -- Вариант 3: Require по базовому имени плагина
-    status, lib = pcall(require, "plugin.http3")
-    if status and type(lib) == "table" and (lib.request or lib.initiateRequest) and lib ~= M then
-        nativeLib = lib
-        return nativeLib
-    end
-
     -- Вариант 4: Динамическая подгрузка бинарных библиотек (.dylib / .so / .dll)
     if package and package.loadlib then
-        local resourceDll = (system and system.pathForFile) and system.pathForFile("plugin_http3_native.dll", system.ResourceDirectory) or ""
-        local resourceDylib = (system and system.pathForFile) and system.pathForFile("plugin_http3_native.dylib", system.ResourceDirectory) or ""
-        local resourceSo = (system and system.pathForFile) and system.pathForFile("plugin_http3_native.so", system.ResourceDirectory) or ""
         local libPath = (system and system.pathForFile) and system.pathForFile("plugin/http3.dylib", system.ResourceDirectory) or "./plugin/http3.dylib"
         local appData = (os.getenv and os.getenv("APPDATA")) or ""
         local coronaPluginsDir = (appData ~= "") and (appData .. "\\Corona Labs\\Corona Simulator\\Plugins\\plugin_http3_native.dll") or ""
@@ -75,9 +80,6 @@ local function loadNativeLibrary()
         local solar2dWinDir = (appData ~= "") and (appData .. "\\Solar2DPlugins\\ovh.azi\\plugin.http3\\win32\\plugin_http3_native.dll") or ""
 
         local dllPaths = {
-            resourceDll,
-            resourceDylib,
-            resourceSo,
             libPath,
             "./plugin_http3_native.dll",
             "../win32/Release/plugin_http3_native.dll",
@@ -152,15 +154,33 @@ function M.request(url, method, listener, params)
 
     local headers = requestParams.headers
     local body = requestParams.body
-    -- Дефолтный таймаут равен 3.0 секундам для всех платформ
+    -- Умолчание таймаута — 3 секунды, и это НЕ описка и не наследие: у
+    -- network.request в Solar2D стоит 30с, но сценария, где такое ожидание
+    -- осмысленно, попросту нет — даже спутниковый канал отвечает много раньше.
+    -- В iOS/macOS 3 секунды приняты стандартом для HTTP/3. Не возвращать к 30с.
     local timeout = requestParams.timeout or 3.0
+
+    -- ПАРАМЕТРЫ ОТКАТА собираем ПОЛНОСТЬЮ, копией исходной таблицы, а не из
+    -- трёх избранных полей. У network.request их больше: bodyType, progress,
+    -- response, handleRedirects. Пересборка из headers/body/timeout молча
+    -- теряла остальные, и опаснее всего терялся bodyType="binary" — без него
+    -- Solar2D отправляет тело как текст UTF-8 и портит любые двоичные данные
+    -- (MessagePack, Protobuf, сырые файлы).
+    local function params_dlya_otkata()
+        local p = {}
+        for k, v in pairs(requestParams) do p[k] = v end
+        p.headers = headers
+        p.body = body
+        p.timeout = timeout
+        return p
+    end
 
     -- Обёртка над слушателем для перехвата ошибок транспорта и аннотации события
     local function wrapperListener(event)
         if event and event.isError and event.reason == "NATIVE_TRANSPORT_FAILED" then
             print("HTTP3: Нативный транспорт недоступен. Автоматическое переключение на Solar2D network.request.")
             if network and network.request then
-                network.request(url, httpMethod, callbackListener, { headers = headers, body = body, timeout = timeout })
+                network.request(url, httpMethod, callbackListener, params_dlya_otkata())
             end
         else
             if event then
@@ -186,6 +206,7 @@ function M.request(url, method, listener, params)
             method = httpMethod,
             headers = headers,
             body = body,
+            bodyType = requestParams.bodyType, -- см. params_dlya_otkata выше
             timeout = timeout,
             listener = wrapperListener
         }
@@ -258,7 +279,7 @@ function M.request(url, method, listener, params)
                     callbackListener:http3Response(evt)
                 end
             end
-        end, { headers = headers, body = body, timeout = timeout })
+        end, params_dlya_otkata())
     end
 
     print("[WARNING] HTTP3: Ни нативный плагин HTTP/3, ни сетевой стек network.request недоступны.")
