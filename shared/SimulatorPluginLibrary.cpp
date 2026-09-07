@@ -1269,7 +1269,16 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
         LogMsg("Http3ThreadFunc: успешный ответ по MsQuic/HTTP3 (QUIC победил по Happy Eyeballs v3)");
         RaceFinish(race, RACE_SUCCESS, state->status, (const char*)state->respBody, state->respBodyLen, "MsQuic/HTTP3", NULL);
     } else {
-        LogMsg("Http3ThreadFunc: сбой транспорта MsQuic/HTTP3");
+        // Различаем ПРОИГРЫШ В ГОНКЕ и настоящий сбой: раньше и то и другое
+        // писалось как «сбой транспорта», хотя в журнале рядом стояло
+        // «handshake завершён» и «StreamSend отправлен успешно» — QUIC
+        // отработал, просто TCP успел раньше. По такому журналу нельзя было
+        // отличить исправный QUIC от сломанного.
+        if (race->winnerAssigned == 2) {
+            LogMsg("Http3ThreadFunc: QUIC исправен, но проиграл гонку TCP (это не сбой)");
+        } else {
+            LogMsg("Http3ThreadFunc: сбой транспорта MsQuic/HTTP3");
+        }
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "Error", "MsQuic/HTTP3 transport failed");
     }
 
@@ -1479,9 +1488,29 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
 // ===========================================================================
 // Оркестратор гонки Happy Eyeballs v3 (draft-ietf-happy-happyeyeballs-v3):
 //   - Первичное подключение: QUIC / HTTP/3 стартует при t = 0.
-//   - Connection Attempt Delay: 250 мс по спецификации §5.
-//   - Вторичное подключение: TCP / HTTP/1.1 стартует при t = 250 мс.
+//   - Connection Attempt Delay: см. HAPPY_EYEBALLS_DELAY_MS ниже.
+//   - Вторичное подключение: TCP / HTTP/1.1 стартует по истечении задержки.
+//
+// ПОЧЕМУ ЗАДЕРЖКА БОЛЬШЕ СПЕЦИФИКАЦИОННЫХ 250 мс.
+// В спецификации 250 мс отмеряются на УСТАНОВКУ СОЕДИНЕНИЯ, которое потом
+// переиспользуется. Здесь же соединение QUIC создаётся ЗАНОВО на каждый запрос
+// и закрывается сразу после ответа (см. очистку в конце Http3ThreadFunc),
+// поэтому каждый запрос платит полное рукопожатие. По журналу плагина оно
+// занимает около 500 мс — вдвое больше окна, и результат закономерен:
+//   запусков QUIC .......... 27
+//   из них добежало до TCP .. 25   (то есть почти всегда)
+//   победил QUIC ............ 15
+//   победил TCP ............. 18
+// Каждый запрос уходил на сервер ДВАЖДЫ (это же видно в журнале Caddy), а
+// работа QUIC чаще всего выбрасывалась.
+//
+// ЭТО ПОЛУМЕРА. Правильное лечение — переиспользование соединения: QUIC ради
+// того и задуман, чтобы рукопожатие делалось один раз, а дальше запросы шли по
+// живому соединению за один RTT. Пока этого нет, задержка поднята выше
+// стоимости рукопожатия, чтобы вторичная попытка запускалась там, где QUIC
+// действительно застрял, а не просто не успел поздороваться.
 // ===========================================================================
+#define HAPPY_EYEBALLS_DELAY_MS 700
 static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
     RaceContext* race = (RaceContext*)param;
     LogMsg("RaceAndRequestThreadFunc: старт гонки MsQuic/HTTP3 vs WinHttp/HTTP1.1 по draft-ietf-happy-happyeyeballs-v3");
@@ -1490,11 +1519,13 @@ static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
     HANDLE hHttp3 = CreateThread(NULL, 0, Http3ThreadFunc, race, 0, NULL);
     if (hHttp3) CloseHandle(hHttp3);
 
-    // Ожидание 250 мс ИЛИ моментального сигнала об ошибке/завершении QUIC
+    // Ожидание HAPPY_EYEBALLS_DELAY_MS ИЛИ моментального сигнала об
+    // ошибке/завершении QUIC (событие взводится и на успешном рукопожатии,
+    // так что при живом QUIC ждать всю задержку не придётся).
     if (race->quicDoneEvent) {
-        WaitForSingleObject(race->quicDoneEvent, 250);
+        WaitForSingleObject(race->quicDoneEvent, HAPPY_EYEBALLS_DELAY_MS);
     } else {
-        Sleep(250);
+        Sleep(HAPPY_EYEBALLS_DELAY_MS);
     }
 
     // По Happy Eyeballs v3 (RFC 8305): Если первичное QUIC-подключение НЕ установило связь (quicProgress == 0)
