@@ -1151,7 +1151,15 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
     HeapFree(heap, 0, headersPayload);
     int dataPos = pos;
     if (req->body_len > 0) {
-        pos = WriteHttp3Frame(state->sendBuf + pos, HTTP3_FRAME_DATA, (const uint8_t*)req->body, req->body_len);
+        // Именно +=, а не =. WriteHttp3Frame возвращает длину СВОЕГО кадра, а
+        // не смещение в буфере. При присваивании pos становился длиной кадра
+        // тела, и длина второго буфера считалась как (тело - заголовки). У
+        // запросов с коротким телом разность отрицательна, в uint32_t это ~4
+        // млрд, MsQuic ловит переполнение суммы длин и отвечает
+        // QUIC_STATUS_INVALID_PARAMETER (0x80070057). Из-за этого HTTP/3 не
+        // работал НИ ДЛЯ ОДНОГО запроса с телом: все POST молча уходили на
+        // запасной HTTP/1.1.
+        pos += WriteHttp3Frame(state->sendBuf + pos, HTTP3_FRAME_DATA, (const uint8_t*)req->body, req->body_len);
     }
 
     long sOpen = api->StreamOpen(c->connection, QUIC_STREAM_OPEN_FLAG_NONE, RequestStreamCallback, state, &state->requestStream);
