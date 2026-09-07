@@ -1025,7 +1025,7 @@ static void PoolInitOnce(void) {
 
 static void PoolCloseConn(Http3Conn* c) {
     if (!c) return;
-    LogMsg("Пул: закрываю соединение");
+    LogHexVal("Пул: закрываю соединение", (unsigned long)(size_t)c);
     if (c->connection && c->api) {
         c->api->ConnectionShutdown(c->connection, QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0);
         c->api->ConnectionClose(c->connection);
@@ -1053,7 +1053,10 @@ static Http3Conn* PoolTake(const char* host, int port) {
         }
     }
     LeaveCriticalSection(&g_PoolLock);
-    LogMsg(nash ? "Пул: НАЙДЕНО тёплое соединение" : "Пул: тёплого соединения нет");
+    // Адрес соединения в журнале: по нему видно, не выдали ли одно и то же
+    // соединение двум запросам разом, пока первый ещё висит на длинном опросе.
+    if (nash) LogHexVal("Пул: НАЙДЕНО тёплое соединение", (unsigned long)(size_t)nash);
+    else LogMsg("Пул: тёплого соединения нет");
     return nash;
 }
 
@@ -1071,8 +1074,8 @@ static void PoolReturn(Http3Conn* c) {
         return;
     }
     EnterCriticalSection(&g_PoolLock);
-    for (int i = 0; i < HTTP3_POOL_SIZE; i++) if (g_Pool[i] == c) { LeaveCriticalSection(&g_PoolLock); LogMsg("Пул: соединение уже в пуле, освобождено"); return; }
-    for (int i = 0; i < HTTP3_POOL_SIZE; i++) if (!g_Pool[i]) { g_Pool[i] = c; LeaveCriticalSection(&g_PoolLock); LogMsg("Пул: соединение СОХРАНЕНО для следующих запросов"); return; }
+    for (int i = 0; i < HTTP3_POOL_SIZE; i++) if (g_Pool[i] == c) { LeaveCriticalSection(&g_PoolLock); LogHexVal("Пул: соединение ОСВОБОЖДЕНО", (unsigned long)(size_t)c); return; }
+    for (int i = 0; i < HTTP3_POOL_SIZE; i++) if (!g_Pool[i]) { g_Pool[i] = c; LeaveCriticalSection(&g_PoolLock); LogHexVal("Пул: соединение СОХРАНЕНО", (unsigned long)(size_t)c); return; }
     LeaveCriticalSection(&g_PoolLock);
     LogMsg("Пул: полон, соединение закрываю");
     PoolCloseConn(c);
@@ -1163,6 +1166,7 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
     }
 
     long sOpen = api->StreamOpen(c->connection, QUIC_STREAM_OPEN_FLAG_NONE, RequestStreamCallback, state, &state->requestStream);
+    LogHexVal("Http3OtpravitZapros: соединение", (unsigned long)(size_t)c);
     LogHexVal("Http3OtpravitZapros: StreamOpen", (unsigned long)sOpen);
     if (sOpen == 0) __sync_add_and_fetch(&g_OtkrytyhPotokov, 1);
     LogHexVal("  живых потоков запросов", (unsigned long)g_OtkrytyhPotokov);
@@ -1384,6 +1388,7 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     long st = 0;
     if (conn) {
         LogMsg("Http3ThreadFunc: соединение взято из пула (без рукопожатия)");
+        LogHexVal("  занято ли соединение", (unsigned long)conn->zanyat);
         conn->ozhidayushchiy = state;
         state->connection = conn->connection;
         if (race) {
