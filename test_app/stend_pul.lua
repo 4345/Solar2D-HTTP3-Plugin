@@ -82,6 +82,10 @@ local function kvantil(d)
 end
 
 print("")
+http3.collectGarbage()
+local stK = http3.getMemoryStats()
+print(string.format("память: нативная %.2f МБ (было %.2f), куча Lua %.2f МБ, активных задач %d",
+    stK.nativeRSSMB or 0, st0.nativeRSSMB or 0, collectgarbage("count") / 1024.0, stK.activeTasks or 0))
 print("==========================================================")
 print(string.format("завершено %d из %d: успешно %d, ошибок %d", zaversheno, vsego, udachno, oshibok))
 print(string.format("время ответа: медиана %.0f мс, 90%% %.0f мс, максимум %.0f мс",
