@@ -117,12 +117,80 @@ static int MyAtoi(const char* s) {
 // Защищено критической секцией: ранее LogMsg вызывался из нескольких потоков
 // одновременно (фоновый запрос + опрос из Lua), что приводило к «разорванным»
 // строкам в консоли и было воспроизводимой гонкой (см. диагностику).
+// ЖУРНАЛ ПЛАГИНА. Раньше обе функции были пустыми ((void)msg;), и от нативного
+// слоя не приходило ни строчки — разобрать гонку Happy Eyeballs было нечем:
+// кто из двух потоков стартовал, когда и почему проиграл, видно только изнутри.
+//
+// Пишем в файл plugin_http3.log рядом с рабочим каталогом процесса (для
+// Solar2D Simulator это каталог проекта). Каждая строка несёт:
+//   <мс от старта системы> [<номер потока>] <текст>
+// Время в миллисекундах от GetTickCount — абсолютная дата тут не нужна, важны
+// ИНТЕРВАЛЫ: задержка перед стартом TCP, длительность рукопожатия QUIC, кто
+// ответил первым. Номер потока обязателен: записи Http3ThreadFunc и
+// Http1ThreadFunc идут вперемешку, и без него их не разделить.
+//
+// Файл открывается на каждую запись и закрывается сразу: диагностика нечастая,
+// зато не нужно держать дескриптор и синхронизировать его между потоками, а
+// дозапись (FILE_APPEND_DATA) с общим доступом не теряет строк соседа.
+//
+// Стандартной библиотеки здесь нет (см. шапку файла), поэтому число в строку
+// переводим сами.
+#define HTTP3_LOG_ENABLED 1   // 0 — собрать без журнала (боевая сборка)
+
+#if HTTP3_LOG_ENABLED
+static void LogPutNum(unsigned long v, char* out, int* pos, int cap) {
+    char tmp[16];
+    int n = 0;
+    if (v == 0) { tmp[n++] = '0'; }
+    while (v > 0 && n < 15) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n > 0 && *pos < cap - 1) { out[(*pos)++] = tmp[--n]; }
+}
+
+static void LogPutStr(const char* s, char* out, int* pos, int cap) {
+    if (!s) return;
+    while (*s && *pos < cap - 1) { out[(*pos)++] = *s++; }
+}
+
+static void LogWrite(const char* msg, const char* dopolnenie, unsigned long chislo, int s_chislom) {
+    char stroka[512];
+    int pos = 0;
+    LogPutNum(GetTickCount(), stroka, &pos, sizeof(stroka));
+    LogPutStr(" [", stroka, &pos, sizeof(stroka));
+    LogPutNum(GetCurrentThreadId(), stroka, &pos, sizeof(stroka));
+    LogPutStr("] ", stroka, &pos, sizeof(stroka));
+    LogPutStr(msg, stroka, &pos, sizeof(stroka));
+    if (dopolnenie) { LogPutStr(dopolnenie, stroka, &pos, sizeof(stroka)); }
+    if (s_chislom) { LogPutStr(" = ", stroka, &pos, sizeof(stroka)); LogPutNum(chislo, stroka, &pos, sizeof(stroka)); }
+    LogPutStr("\r\n", stroka, &pos, sizeof(stroka));
+
+    HANDLE h = CreateFileA("plugin_http3.log", FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD zapisano = 0;
+        WriteFile(h, stroka, (DWORD)pos, &zapisano, 0);
+        CloseHandle(h);
+    }
+    // Дублируем в отладочный вывод: под отладчиком/DebugView видно без файла.
+    stroka[pos] = 0;
+    OutputDebugStringA(stroka);
+}
+#endif
+
 static void LogMsg(const char* msg) {
+#if HTTP3_LOG_ENABLED
+    LogWrite(msg, 0, 0, 0);
+#else
     (void)msg;
+#endif
 }
 
 static void LogHexVal(const char* label, unsigned long val) {
+#if HTTP3_LOG_ENABLED
+    LogWrite(label, 0, val, 1);
+#else
     (void)label; (void)val;
+#endif
 }
 
 typedef struct RequestResult {

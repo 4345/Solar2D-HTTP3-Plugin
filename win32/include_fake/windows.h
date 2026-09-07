@@ -167,6 +167,33 @@ __declspec(dllimport) BOOL __stdcall FreeLibrary(HMODULE hLibModule);
 __declspec(dllimport) HANDLE __stdcall GetStdHandle(DWORD nStdHandle);
 __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE hFile, const void* lpBuffer, DWORD nNumberOfBytesToWrite, DWORD* lpNumberOfBytesWritten, OVERLAPPED* lpOverlapped);
 __declspec(dllimport) void __stdcall OutputDebugStringA(const char* lpOutputString);
+
+/* Нужно журналу плагина (LogMsg в SimulatorPluginLibrary.cpp): открыть файл на
+   дозапись и узнать номер потока — без номера гонку Happy Eyeballs по журналу
+   не разобрать, записи двух потоков перемешаны. */
+__declspec(dllimport) DWORD __stdcall GetCurrentThreadId(void);
+__declspec(dllimport) HANDLE __stdcall CreateFileA(const char* lpFileName, DWORD dwDesiredAccess,
+                                                   DWORD dwShareMode, void* lpSecurityAttributes,
+                                                   DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
+                                                   HANDLE hTemplateFile);
+#ifndef FILE_APPEND_DATA
+#define FILE_APPEND_DATA 0x0004
+#endif
+#ifndef FILE_SHARE_READ
+#define FILE_SHARE_READ 0x00000001
+#endif
+#ifndef FILE_SHARE_WRITE
+#define FILE_SHARE_WRITE 0x00000002
+#endif
+#ifndef OPEN_ALWAYS
+#define OPEN_ALWAYS 4
+#endif
+#ifndef FILE_ATTRIBUTE_NORMAL
+#define FILE_ATTRIBUTE_NORMAL 0x00000080
+#endif
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE ((HANDLE)(long)-1)
+#endif
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
 
 #ifdef __cplusplus
