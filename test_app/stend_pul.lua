@@ -23,6 +23,16 @@ local telo_len = tonumber(arg and arg[4]) or 0
 local telo    = telo_len > 0 and string.rep("x", telo_len) or nil
 local metod   = telo and "POST" or "GET"
 
+-- В CLI движка Solar2D нет, и запасной network.request звать некому. Без
+-- заглушки запрос, ушедший на откат, не позовёт колбэк никогда и повесит
+-- прогон. Заглушка отвечает сразу ошибкой: такой запрос виден как откат.
+if not network then
+    network = { request = function(url, method, listener, params)
+        if listener then listener({ isError = true, status = -1, transport = "откат-заглушка" }) end
+        return 0
+    end, cancel = function() end }
+end
+
 local ok, http3 = pcall(require, "plugin_http3")
 if not ok then print("плагин не загрузился: " .. tostring(http3)); os.exit(1) end
 local st0 = http3.getMemoryStats()
@@ -82,6 +92,10 @@ local function kvantil(d)
 end
 
 print("")
+http3.collectGarbage()
+local stK = http3.getMemoryStats()
+print(string.format("память: нативная %.2f МБ (было %.2f), куча Lua %.2f МБ, активных задач %d",
+    stK.nativeRSSMB or 0, st0.nativeRSSMB or 0, collectgarbage("count") / 1024.0, stK.activeTasks or 0))
 print("==========================================================")
 print(string.format("завершено %d из %d: успешно %d, ошибок %d", zaversheno, vsego, udachno, oshibok))
 print(string.format("время ответа: медиана %.0f мс, 90%% %.0f мс, максимум %.0f мс",
