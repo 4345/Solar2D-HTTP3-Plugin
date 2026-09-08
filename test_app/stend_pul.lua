@@ -20,6 +20,9 @@ local vsego   = tonumber(arg and arg[1]) or 120
 local razom   = tonumber(arg and arg[2]) or 4
 local adres   = (arg and arg[3]) or "https://cloudflare-quic.com"
 local telo_len = tonumber(arg and arg[4]) or 0
+-- Таймаут запроса: от него плагин отсчитывает второе окно гонки, поэтому им
+-- же проверяется и само окно.
+local taymaut  = tonumber(arg and arg[5]) or 5
 local telo    = telo_len > 0 and string.rep("x", telo_len) or nil
 local metod   = telo and "POST" or "GET"
 
@@ -38,7 +41,7 @@ if not ok then print("плагин не загрузился: " .. tostring(http
 local st0 = http3.getMemoryStats()
 print(string.format("стек: %s | сборка: %s", tostring(st0.stackName), tostring(st0.buildTimestamp)))
 print(string.format("адрес: %s | метод: %s | тело: %d Б | всего: %d | одновременно: %d",
-    adres, metod, telo_len, vsego, razom))
+    adres, metod, telo_len, vsego, razom) .. string.format(" | таймаут: %g с", taymaut))
 print("")
 
 local zapushcheno, zaversheno = 0, 0
@@ -68,7 +71,7 @@ local function pustit()
                     tr, tostring(evt and (evt.reason or evt.error))))
             end
         end
-    end, { timeout = 5, body = telo, bodyType = telo and "binary" or nil,
+    end, { timeout = taymaut, body = telo, bodyType = telo and "binary" or nil,
            -- Несколько заголовков среднего размера: кадр заголовков должен быть
            -- заметно длиннее короткого тела - именно на таком соотношении и
            -- вылезала ошибка длины второго буфера.
