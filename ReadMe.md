@@ -163,9 +163,26 @@ Android-сборку плагина туда кладёт задача Gradle:
 cd android && ./gradlew :plugin:deployToLocalSolar2DRepo
 ```
 
-Она деплоит в каталог `plugin.http3.ntv` (по имени нативного модуля) — если
-приложение объявляет `plugin.http3`, скопируйте `data.tgz` оттуда в
-`plugin.http3/android`.
+Она кладёт архив по имени плагина из `build.settings` — то есть в
+`plugin.http3/android`, откуда Solar2D его и читает. Копировать вручную не надо.
+
+> Раньше задача клала архив в каталог `plugin.http3.ntv` — по имени нативного
+> МОДУЛЯ, а не плагина. Отказа при этом не было: задача сообщала об успехе, а
+> сборка молча продолжала брать прежнюю копию. Исправлено.
+
+**Чем собирать.** Нужен JDK 17 (проверено) — им же располагает и сама Solar2D:
+`<Solar2D>/Corona/jre`. На JDK 25 сборка падает ещё на конфигурации, с
+`IllegalArgumentException: 25.0.3` из `JavaVersion.parse`: компилятор Kotlin,
+которым Gradle 8.13 собирает скрипты `.kts`, такую версию не разбирает. Если
+Android Studio обновилась и её JDK стал 25-м, укажите другой явно. На Windows
+корневой `build.gradle.kts` берёт путь к Corona Native из переменной
+`CORONA_ROOT`, её тоже нужно задать:
+
+```
+set JAVA_HOME=C:\Program Files (x86)\Corona Labs\Corona\jre
+set CORONA_ROOT=C:/Program Files (x86)/Corona Labs/Corona/Native
+cd android && gradlew :plugin:deployToLocalSolar2DRepo
+```
 
 ---
 
