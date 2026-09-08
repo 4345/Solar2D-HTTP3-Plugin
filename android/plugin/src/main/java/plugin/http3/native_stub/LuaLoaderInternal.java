@@ -33,6 +33,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -55,8 +56,16 @@ public class LuaLoaderInternal implements JavaFunction {
 
     // --- Состояние CronetEngine (инициализируется лениво, один раз на процесс) ---
     private static boolean sCronetInitialized = false;
-    private static boolean sCronetInitializationFailed = false;
     private static CronetEngine sCronetEngine = null;
+
+    // До какого момента не пытаться поднимать Cronet снова. Провал раньше не
+    // запоминался вовсе: поле sCronetInitializationFailed было объявлено, но
+    // ему никогда не присваивали и его нигде не читали, поэтому после неудачи
+    // КАЖДЫЙ следующий запрос заново шёл в установку провайдера и ждал её до
+    // пяти секунд. Поле убрано, вместо флага - момент, до которого не пробуем:
+    // он и запоминает провал, и сам снимает запрет.
+    private static volatile long sCronetSboyDo = 0;
+    private static final long CRONET_PAUZA_POSLE_SBOYA_MS = 60000;
 
     // Пул потоков для выполнения запросов Cronet
     private static final Executor sExecutor = Executors.newCachedThreadPool();
@@ -66,7 +75,24 @@ public class LuaLoaderInternal implements JavaFunction {
 
     // Счетчик и реестр активных запросов по уникальному ID
     private static final AtomicInteger sRequestIdCounter = new AtomicInteger(1);
-    private static final Map<Integer, UrlRequest> sActiveRequestsMap = new ConcurrentHashMap<>();
+    // Состояние одного запроса. Раньше в реестре лежал только UrlRequest, и по
+    // событию onCanceled было не различить, кто отмену вызвал: сторож по
+    // таймауту, вызывающий из Lua или сбой сети. Все три случая шли одной
+    // дорогой в triggerFallback, а по нему Lua-обёртка ОТПРАВЛЯЛА ЗАПРОС
+    // ЗАНОВО через network.request. То есть отмена приводила к новому запросу,
+    // а таймаут - ко второму ожиданию той же длины.
+    private static final class Zapros {
+        final UrlRequest request;
+        final AtomicBoolean poTaymautu;
+        final AtomicBoolean otmenenVyzyvayushchim;
+        Zapros(UrlRequest request, AtomicBoolean poTaymautu, AtomicBoolean otmenenVyzyvayushchim) {
+            this.request = request;
+            this.poTaymautu = poTaymautu;
+            this.otmenenVyzyvayushchim = otmenenVyzyvayushchim;
+        }
+    }
+
+    private static final Map<Integer, Zapros> sActiveRequestsMap = new ConcurrentHashMap<>();
     private static final AtomicLong sTotalCompleted = new AtomicLong(0);
     private static final AtomicLong sTotalFailed = new AtomicLong(0);
 
@@ -99,6 +125,11 @@ public class LuaLoaderInternal implements JavaFunction {
         if (sCronetInitialized) {
             return true;
         }
+        if (System.currentTimeMillis() < sCronetSboyDo) {
+            // Недавняя попытка провалилась. Повторять её сразу бессмысленно и
+            // дорого: внутри ожидание установки провайдера до пяти секунд.
+            return false;
+        }
 
         try {
             Log.i(TAG, "Инициализация Cronet через Google Play Services...");
@@ -127,7 +158,7 @@ public class LuaLoaderInternal implements JavaFunction {
                     builder = new CronetEngine.Builder(context);
                 } catch (Throwable t) {
                     Log.w(TAG, "Установка CronetProvider через Google Play Services завершилась с ошибкой: " + t.getMessage());
-                    return false;
+                    return zapomnitSboy();
                 }
             }
 
@@ -175,8 +206,14 @@ public class LuaLoaderInternal implements JavaFunction {
             return true;
         } catch (Throwable t) {
             Log.w(TAG, "Не удалось инициализировать Cronet: " + t.getMessage());
-            return false;
+            return zapomnitSboy();
         }
+    }
+
+    // Запоминает провал и назначает паузу до следующей попытки.
+    private static boolean zapomnitSboy() {
+        sCronetSboyDo = System.currentTimeMillis() + CRONET_PAUZA_POSLE_SBOYA_MS;
+        return false;
     }
 
     // ===========================================================================
@@ -203,7 +240,7 @@ public class LuaLoaderInternal implements JavaFunction {
             String url = L.checkString(1);
 
             String method = "GET";
-            double timeoutSec = 15.0;
+            double timeoutSec = 3.0;   // как в plugin_http3.lua и в версиях для Windows и iOS
             // Тело — БАЙТЫ, а не String. Строка Java хранит символы, и любой
             // перевод байт<->String идёт через кодировку: двоичные данные
             // (MessagePack, Protobuf, сырые файлы) валидным UTF-8 не являются,
@@ -286,7 +323,7 @@ public class LuaLoaderInternal implements JavaFunction {
             }
 
             if (timeoutSec <= 0) {
-                timeoutSec = 15.0;
+                timeoutSec = 3.0;
             }
 
             // Валидация слушателя событий Lua
@@ -305,7 +342,14 @@ public class LuaLoaderInternal implements JavaFunction {
                 return 1;
             }
 
-            if (!initializeCronet(context)) {
+            // Инициализацию Cronet здесь НЕ делаем. Этот метод выполняется на
+            // потоке Lua, а внутри инициализации ожидание установки провайдера
+            // до пяти секунд - игра вставала бы на всё это время, и на каждом
+            // запросе заново, пока провайдер недоступен. Поэтому инициализация
+            // уходит в фоновый поток вместе с самим запросом (см. ниже), а
+            // здесь остаётся только дешёвая проверка: если попытка провалилась
+            // только что, сразу отдаём nil, и Lua-обёртка берёт network.request.
+            if (System.currentTimeMillis() < sCronetSboyDo) {
                 CoronaLua.deleteRef(L, listenerRef);
                 L.pushNil();
                 return 1;
@@ -323,6 +367,11 @@ public class LuaLoaderInternal implements JavaFunction {
                 @Override
                 public void run() {
                     try {
+                        if (!initializeCronet(context)) {
+                            sTotalFailed.incrementAndGet();
+                            triggerFallback(dispatcher, listenerRef);
+                            return;
+                        }
                         startCronetRequest(requestId, url, finalMethod, finalHeaders, finalBody, finalTimeout, dispatcher, listenerRef);
                     } catch (Exception e) {
                         Log.e(TAG, "Ошибка при запуске запроса Cronet: " + e.getMessage());
@@ -351,9 +400,13 @@ public class LuaLoaderInternal implements JavaFunction {
         public int invoke(LuaState L) {
             if (L.type(1) == LuaType.NUMBER) {
                 int reqId = L.toInteger(1);
-                UrlRequest req = sActiveRequestsMap.remove(reqId);
-                if (req != null) {
-                    req.cancel();
+                Zapros z = sActiveRequestsMap.remove(reqId);
+                if (z != null) {
+                    // Пометка ДО cancel(): по ней onCanceled поймёт, что отмену
+                    // заказал вызывающий, и не станет выдавать это за сбой
+                    // транспорта, по которому запрос отправился бы заново.
+                    z.otmenenVyzyvayushchim.set(true);
+                    z.request.cancel();
                     sTotalFailed.incrementAndGet();
                     L.pushBoolean(true);
                     return 1;
@@ -441,6 +494,11 @@ public class LuaLoaderInternal implements JavaFunction {
         final ByteArrayOutputStream responseStream = new ByteArrayOutputStream();
         final WritableByteChannel responseChannel = Channels.newChannel(responseStream);
         final ScheduledFuture<?>[] watchdogHolder = new ScheduledFuture<?>[1];
+        // Причина завершения. Cronet на все три случая - таймаут, отмена
+        // вызывающим и обрыв - зовёт один и тот же onCanceled, различить их
+        // можно только своей пометкой.
+        final AtomicBoolean poTaymautu = new AtomicBoolean(false);
+        final AtomicBoolean otmenenVyzyvayushchim = new AtomicBoolean(false);
 
         UrlRequest.Callback callback = new UrlRequest.Callback() {
             @Override
@@ -476,15 +534,16 @@ public class LuaLoaderInternal implements JavaFunction {
                 // UTF-8, заменив невалидные байты на U+FFFD.
                 final byte[] responseBytes = responseStream.toByteArray();
                 final int bytesTotal = responseStream.size();
-                final boolean isError = statusCode >= 400;
-                final String reason = isError ? "HTTP Error " + statusCode : null;
+                // isError - ТОЛЬКО про сбой транспорта, как у network.request в
+                // Solar2D и как в версии для Windows. Код 4xx/5xx это нормально
+                // доставленный ответ: он приезжает в status, а разбирает его
+                // вызывающий. Раньше здесь стояло statusCode >= 400, и любой
+                // ответ 401 выглядел для вызывающего обрывом сети - в частности,
+                // обновление истёкшего токена по коду 401 не срабатывало вовсе.
+                final boolean isError = false;
+                final String reason = null;
                 final Map<String, List<String>> responseHeaders = info.getAllHeaders();
-
-                if (isError) {
-                    sTotalFailed.incrementAndGet();
-                } else {
-                    sTotalCompleted.incrementAndGet();
-                }
+                sTotalCompleted.incrementAndGet();
 
                 final String rawProtocol = info != null ? info.getNegotiatedProtocol() : "";
                 final String protocolString;
@@ -577,7 +636,23 @@ public class LuaLoaderInternal implements JavaFunction {
                 if (watchdogHolder[0] != null) watchdogHolder[0].cancel(false);
                 sActiveRequestsMap.remove(requestId);
                 sTotalFailed.incrementAndGet();
-                triggerFallback(dispatcher, listenerRef);
+
+                if (otmenenVyzyvayushchim.get()) {
+                    // Отмену заказал вызывающий. network.request в Solar2D в этом
+                    // случае слушателя не зовёт вовсе - он и так знает, что
+                    // отменил. Но ссылку на слушателя отпустить обязаны, иначе
+                    // она останется в реестре Lua навсегда.
+                    osvobodit(dispatcher, listenerRef);
+                } else if (poTaymautu.get()) {
+                    // Вышел таймаут, заказанный вызывающим. Выдавать это за сбой
+                    // транспорта нельзя: по такому сообщению Lua-обёртка шлёт
+                    // запрос заново, и ожидание удваивается - заказали 5 секунд,
+                    // получили десять.
+                    soobshchitOshibku(dispatcher, listenerRef, "TIMEOUT",
+                                      "Превышен таймаут запроса");
+                } else {
+                    triggerFallback(dispatcher, listenerRef);
+                }
             }
         };
 
@@ -598,17 +673,72 @@ public class LuaLoaderInternal implements JavaFunction {
         }
 
         final UrlRequest request = requestBuilder.build();
-        sActiveRequestsMap.put(requestId, request);
+        sActiveRequestsMap.put(requestId, new Zapros(request, poTaymautu, otmenenVyzyvayushchim));
 
         long timeoutMillis = (long)(timeoutSec * 1000.0);
         watchdogHolder[0] = sWatchdog.schedule(new Runnable() {
             @Override
             public void run() {
+                poTaymautu.set(true);
                 request.cancel();
             }
         }, timeoutMillis, TimeUnit.MILLISECONDS);
 
         request.start();
+    }
+
+    /**
+     * Отпускает ссылку на слушателя, не вызывая его. Нужно при отмене по
+     * заказу вызывающего: событие ему не положено, а ссылку освободить надо.
+     */
+    private static void osvobodit(final CoronaRuntimeTaskDispatcher dispatcher, final int listenerRef) {
+        dispatcher.send(new CoronaRuntimeTask() {
+            @Override
+            public void executeUsing(CoronaRuntime runtime) {
+                CoronaLua.deleteRef(runtime.getLuaState(), listenerRef);
+            }
+        });
+    }
+
+    /**
+     * Сообщает об ошибке запроса, НЕ выдавая её за недоступность транспорта:
+     * причина отлична от NATIVE_TRANSPORT_FAILED, и Lua-обёртка не станет
+     * отправлять запрос заново.
+     */
+    private static void soobshchitOshibku(final CoronaRuntimeTaskDispatcher dispatcher,
+                                          final int listenerRef,
+                                          final String prichina,
+                                          final String opisanie) {
+        dispatcher.send(new CoronaRuntimeTask() {
+            @Override
+            public void executeUsing(CoronaRuntime runtime) {
+                LuaState L = runtime.getLuaState();
+                CoronaLua.newEvent(L, "http3");
+
+                L.pushBoolean(true);
+                L.setField(-2, "isError");
+
+                L.pushString(prichina);
+                L.setField(-2, "reason");
+
+                L.pushString(opisanie);
+                L.setField(-2, "error");
+
+                L.pushInteger(0);
+                L.setField(-2, "status");
+
+                L.pushString("Cronet");
+                L.setField(-2, "transport");
+
+                try {
+                    CoronaLua.dispatchEvent(L, listenerRef, 0);
+                } catch (Exception e) {
+                    Log.e(TAG, "Ошибка отправки события в Lua: " + e.getMessage());
+                } finally {
+                    CoronaLua.deleteRef(L, listenerRef);
+                }
+            }
+        });
     }
 
     /**
