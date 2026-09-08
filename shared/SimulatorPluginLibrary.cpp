@@ -1005,6 +1005,7 @@ typedef struct Http3Conn {
     volatile long mertvo;
     unsigned long poslednee;
     unsigned long prostoy;   // сколько соединение простояло к моменту выдачи из пула
+    unsigned long nachalo_rukopozhatiya;   // засечка для замера, см. ZapomnitRukopozhatie
     Http3State* ozhidayushchiy;
     uint8_t ctrlBuf[16];
     uint8_t encoderBuf[8];
@@ -1013,6 +1014,87 @@ typedef struct Http3Conn {
     QUIC_BUFFER encoderSendBuf;
     QUIC_BUFFER decoderSendBuf;
 } Http3Conn;
+
+// ===========================================================================
+// ЗАМЕР РУКОПОЖАТИЯ ПО ХОСТАМ — основание для первого окна гонки.
+//
+// Первое окно (Connection Attempt Delay) отмеряет, сколько ждать установления
+// соединения по QUIC, прежде чем поднимать запасную попытку по TCP. Раньше это
+// была константа, и никакая константа тут не годится: стоимость рукопожатия
+// целиком определяется расстоянием до сервера. На плече в 5000 км RTT по
+// волокну не меньше 50 мс, реально около сотни, и рукопожатие стоит столько же;
+// на сервере в километре это единицы миллисекунд. Разница в десятки раз, и одно
+// число обслужить оба случая не может: тесное окно даёт лишние попытки TCP там,
+// где QUIC просто не успел поздороваться, а широкое заставляет застрявший QUIC
+// ждать страховки непозволительно долго — и это как раз случай БЛИЗКОГО
+// сервера, где всё остальное укладывается в миллисекунды.
+//
+// Поэтому окно считается от измеренного: держим по хосту скользящее среднее
+// длительности рукопожатия и берём его с запасом. Пока измерений нет — окно
+// максимальное, то есть заведомо безопасное.
+// ===========================================================================
+#define OKNO_SOED_MIN_MS 150
+#define OKNO_SOED_MAX_MS 700
+#define OKNO_SOED_ZAPAS 2       // во столько раз окно шире среднего рукопожатия
+#define ZAMEROV_HOSTOV 8
+
+typedef struct ZamerHosta {
+    char host[256];
+    unsigned long srednee;   // скользящее среднее рукопожатия, мс
+    int est;
+} ZamerHosta;
+
+static ZamerHosta g_Zamery[ZAMEROV_HOSTOV];
+static CRITICAL_SECTION g_ZameryLock;
+static volatile long g_ZameryReady = 0;
+
+static void ZameryInitOnce(void) {
+    if (__sync_bool_compare_and_swap(&g_ZameryReady, 0, 1)) {
+        InitializeCriticalSection(&g_ZameryLock);
+        for (int i = 0; i < ZAMEROV_HOSTOV; i++) { g_Zamery[i].host[0] = 0; g_Zamery[i].est = 0; }
+        __sync_bool_compare_and_swap(&g_ZameryReady, 1, 2);
+    }
+    while (g_ZameryReady != 2) { Sleep(1); }
+}
+
+// Скользящее среднее с весом 1/4 у нового замера: реагирует на смену сети, но
+// не дёргается от одиночного выброса.
+static void ZapomnitRukopozhatie(const char* host, unsigned long ms) {
+    if (!host || !host[0]) return;
+    ZameryInitOnce();
+    EnterCriticalSection(&g_ZameryLock);
+    int svobodnyy = -1;
+    for (int i = 0; i < ZAMEROV_HOSTOV; i++) {
+        if (g_Zamery[i].est && MyStrCmp(g_Zamery[i].host, host) == 0) {
+            g_Zamery[i].srednee = (g_Zamery[i].srednee * 3 + ms) / 4;
+            LeaveCriticalSection(&g_ZameryLock);
+            return;
+        }
+        if (!g_Zamery[i].est && svobodnyy < 0) svobodnyy = i;
+    }
+    if (svobodnyy < 0) svobodnyy = 0;   // таблица полна: вытесняем первую запись
+    MyStrCopy(g_Zamery[svobodnyy].host, sizeof(g_Zamery[svobodnyy].host), host);
+    g_Zamery[svobodnyy].srednee = ms;
+    g_Zamery[svobodnyy].est = 1;
+    LeaveCriticalSection(&g_ZameryLock);
+}
+
+static unsigned long OknoSoedineniya(const char* host) {
+    if (!host || !host[0]) return OKNO_SOED_MAX_MS;
+    ZameryInitOnce();
+    unsigned long okno = OKNO_SOED_MAX_MS;
+    EnterCriticalSection(&g_ZameryLock);
+    for (int i = 0; i < ZAMEROV_HOSTOV; i++) {
+        if (g_Zamery[i].est && MyStrCmp(g_Zamery[i].host, host) == 0) {
+            okno = g_Zamery[i].srednee * OKNO_SOED_ZAPAS;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ZameryLock);
+    if (okno < OKNO_SOED_MIN_MS) okno = OKNO_SOED_MIN_MS;
+    if (okno > OKNO_SOED_MAX_MS) okno = OKNO_SOED_MAX_MS;
+    return okno;
+}
 
 static volatile long g_OtkrytyhPotokov = 0;   // диагностика: живых потоков запросов
 static Http3Conn* g_Pool[HTTP3_POOL_SIZE];
@@ -1210,6 +1292,14 @@ static long __cdecl ConnectionCallback(HQUIC Connection, void* Context, QUIC_CON
     switch (Event->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED: {
             LogMsg("Http3ThreadFunc: QUIC handshake завершён (CONNECTED)");
+            // Стоимость рукопожатия до этого хоста — основание для первого окна
+            // гонки (см. ZapomnitRukopozhatie).
+            if (c->nachalo_rukopozhatiya) {
+                unsigned long ushlo = GetTickCount() - c->nachalo_rukopozhatiya;
+                c->nachalo_rukopozhatiya = 0;   // повторно на том же соединении не считаем
+                ZapomnitRukopozhatie(c->host, ushlo);
+                LogHexVal("  рукопожатие, мс", ushlo);
+            }
             Http3State* pend = c->ozhidayushchiy;
             LogMsg(pend ? "ConnectionCallback: ожидающий запрос ЕСТЬ" : "ConnectionCallback: ожидающего запроса НЕТ");
             if (pend && pend->race) {
@@ -1415,6 +1505,7 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
         conn->ozhidayushchiy = state;
         MyStrCopy(conn->host, sizeof(conn->host), host);
 
+        conn->nachalo_rukopozhatiya = GetTickCount();
         st = api->ConnectionOpen(g_MsQuicRegistration, ConnectionCallback, conn, &conn->connection);
         LogHexVal("ConnectionOpen", st);
         state->connection = conn->connection;
@@ -1698,25 +1789,29 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
 // ===========================================================================
 // Оркестратор гонки Happy Eyeballs v3 (draft-ietf-happy-happyeyeballs-v3):
 //   - Первичное подключение: QUIC / HTTP/3 стартует при t = 0.
-//   - Connection Attempt Delay: см. HAPPY_EYEBALLS_DELAY_MS ниже.
-//   - Вторичное подключение: TCP / HTTP/1.1 стартует по истечении задержки.
+//   - Connection Attempt Delay: измеряется, см. OknoSoedineniya выше.
+//   - Вторичное подключение: TCP / HTTP/1.1 стартует по истечении окна.
 //
-// ПОЧЕМУ ЗАДЕРЖКА БОЛЬШЕ СПЕЦИФИКАЦИОННЫХ 250 мс.
-// В спецификации 250 мс отмеряются на УСТАНОВКУ СОЕДИНЕНИЯ, которое потом
-// переиспользуется. Когда-то здесь соединение QUIC создавалось ЗАНОВО на каждый
-// запрос, каждый платил полное рукопожатие (по журналу около 500 мс — вдвое
-// больше окна), и вторичная попытка уходила почти всегда: из 27 запусков QUIC
-// до TCP добегали 25, а побеждал TCP в 18 случаях из 33. Запрос уходил на сервер
-// дважды, и работа QUIC чаще всего выбрасывалась.
+// ПОЧЕМУ ОКНО НЕ КОНСТАНТА.
+// Здесь стояли 700 мс — величина, подобранная под конкретное развёртывание, где
+// сервер разработки намеренно вынесен за пять тысяч километров, чтобы ловить
+// издержки больших задержек. На таком плече рукопожатие стоит сотни
+// миллисекунд, и спецификационные 250 мс были бы слишком тесны: вторичная
+// попытка уходила бы там, где QUIC просто не успел поздороваться. Но на боевом
+// сервере в километре от клиента рукопожатие — единицы миллисекунд, и те же
+// 700 мс превращаются в свою противоположность: застрявший QUIC ждёт страховки
+// почти секунду там, где всё остальное укладывается в миллисекунды.
 //
-// Теперь соединения переиспользуются (см. пул выше), и рукопожатие на тёплом
-// пути не делается вовсе. Значит исходная причина завышенной задержки отпала, и
-// её стоит опустить ближе к спецификационным 250 мс — но это отдельная настройка
-// со своим замером, поэтому значение пока оставлено прежним. Уменьшать вслепую
-// нельзя: холодный путь по-прежнему платит рукопожатие, и слишком узкое окно
-// вернёт лишние попытки TCP там, где QUIC просто не успел поздороваться.
+// Одно число не обслуживает оба случая, поэтому числа больше нет: окно берётся
+// от измеренной стоимости рукопожатия до КАЖДОГО хоста (ZapomnitRukopozhatie
+// и OknoSoedineniya выше). Пол и потолок оставлены — 150 и 700 мс, — чтобы
+// одиночный выброс не сделал окно бессмысленно узким или широким.
+//
+// Для истории: пока соединения не переиспользовались, каждый запрос платил
+// полное рукопожатие, и вторичная попытка уходила почти всегда — из 27 запусков
+// QUIC до TCP добегали 25, побеждал TCP в 18 случаях из 33. Пул это устранил, а
+// измеряемое окно снимает и остаток.
 // ===========================================================================
-#define HAPPY_EYEBALLS_DELAY_MS 700
 // Второе окно — на ОТВЕТ по уже установленному соединению QUIC (см. ниже, в
 // оркестраторе). Соединение может встать молча после подключения, и без этого
 // окна запрос остался бы без запасного пути до самого таймаута.
@@ -1745,13 +1840,24 @@ static unsigned long __stdcall RaceAndRequestThreadFunc(void* param) {
     HANDLE hHttp3 = CreateThread(NULL, 0, Http3ThreadFunc, race, 0, NULL);
     if (hHttp3) CloseHandle(hHttp3);
 
-    // Ожидание HAPPY_EYEBALLS_DELAY_MS ИЛИ моментального сигнала об
-    // ошибке/завершении QUIC (событие взводится и на успешном рукопожатии,
-    // так что при живом QUIC ждать всю задержку не придётся).
+    // Окно берётся по измеренной стоимости рукопожатия до ЭТОГО хоста, а не из
+    // константы: см. ZapomnitRukopozhatie. Хост разбираем здесь же — дешевле,
+    // чем тащить его через контекст гонки.
+    char hostOkna[256]; int portOkna = 0; char putOkna[1024]; int secOkna = 0;
+    unsigned long oknoSoed = OKNO_SOED_MAX_MS;
+    if (race->req && ParseUrl(race->req->url, hostOkna, sizeof(hostOkna), &portOkna,
+                              putOkna, sizeof(putOkna), &secOkna)) {
+        oknoSoed = OknoSoedineniya(hostOkna);
+    }
+    LogHexVal("RaceAndRequestThreadFunc: окно соединения, мс", oknoSoed);
+
+    // Ожидание окна ИЛИ моментального сигнала об ошибке/завершении QUIC
+    // (событие взводится и на успешном рукопожатии, так что при живом QUIC
+    // ждать всю задержку не придётся).
     if (race->quicDoneEvent) {
-        WaitForSingleObject(race->quicDoneEvent, HAPPY_EYEBALLS_DELAY_MS);
+        WaitForSingleObject(race->quicDoneEvent, oknoSoed);
     } else {
-        Sleep(HAPPY_EYEBALLS_DELAY_MS);
+        Sleep(oknoSoed);
     }
 
     // По Happy Eyeballs v3 (RFC 8305): Если первичное QUIC-подключение НЕ установило связь (quicProgress == 0)
