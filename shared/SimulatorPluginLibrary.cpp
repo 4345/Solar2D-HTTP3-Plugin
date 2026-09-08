@@ -444,7 +444,12 @@ typedef struct AsyncRequestContext {
     int id;
     char url[1024];
     char method[16];
-    char body[4096];
+    // Тело выделяется по фактическому размеру. Раньше здесь был массив на
+    // 4096 байт, и всё, что длиннее, МОЛЧА обрезалось до 4095 - см. чтение
+    // параметров ниже. Заметить это было нельзя: запрос уходил, сервер
+    // отвечал, просто содержимое было неполным. Голосовое сообщение в 19 КБ
+    // приезжало обрубком в 4 КБ.
+    char* body;
     int body_len;
     char headers[2048];
     int secure;
@@ -483,7 +488,10 @@ static void ReleaseRaceContext(RaceContext* race) {
     if (remaining == 0) {
         void* heap = GetProcessHeap();
         if (race->quicDoneEvent) CloseHandle(race->quicDoneEvent);
-        if (race->req) HeapFree(heap, 0, race->req);
+        if (race->req) {
+            if (race->req->body) HeapFree(heap, 0, race->req->body);
+            HeapFree(heap, 0, race->req);
+        }
         HeapFree(heap, 0, race);
     }
 }
@@ -1277,6 +1285,7 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
     }
 
     long sOpen = api->StreamOpen(c->connection, QUIC_STREAM_OPEN_FLAG_NONE, RequestStreamCallback, state, &state->requestStream);
+    LogHexVal("Http3OtpravitZapros: тело запроса, Б", (unsigned long)req->body_len);
     LogHexVal("Http3OtpravitZapros: соединение", (unsigned long)(size_t)c);
     LogHexVal("Http3OtpravitZapros: StreamOpen", (unsigned long)sOpen);
     if (sOpen == 0) __sync_add_and_fetch(&g_OtkrytyhPotokov, 1);
@@ -2020,10 +2029,14 @@ static int initiateRequest( lua_State *L )
             size_t b_len = 0;
             const char* body = lua_tolstring(L, -1, &b_len);
             if (body && b_len > 0) {
-                req->body_len = (int)b_len;
-                if (req->body_len > 4095) req->body_len = 4095;
-                for (int i = 0; i < req->body_len; i++) req->body[i] = body[i];
-                req->body[req->body_len] = '\0';
+                // Ровно по размеру, без потолка: обрезание тела не даёт ни
+                // ошибки, ни признака в ответе, а данные при этом теряются.
+                req->body = (char*)HeapAlloc(heap, 0, b_len + 1);
+                if (req->body) {
+                    req->body_len = (int)b_len;
+                    for (size_t k = 0; k < b_len; k++) req->body[k] = body[k];
+                    req->body[b_len] = '\0';
+                }
             }
         }
         lua_pop(L, 1);
