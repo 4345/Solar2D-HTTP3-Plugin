@@ -451,7 +451,11 @@ typedef struct AsyncRequestContext {
     // приезжало обрубком в 4 КБ.
     char* body;
     int body_len;
-    char headers[2048];
+    // Заголовки, как и тело, собираются по фактическому размеру. Раньше был
+    // массив на 2048 байт с обрезанием на 2040 - тем же молчаливым приёмом,
+    // что и у тела: запрос уходил бы с урезанным набором, и ни ошибки, ни
+    // признака в ответе.
+    char* headers;
     int secure;
     // Таймаут ЭТОГО запроса, мс. Раньше нативный слой брал зашитую константу, а
     // параметр timeout из Lua не читал вовсе, хотя Lua его передавал. Любой
@@ -490,6 +494,7 @@ static void ReleaseRaceContext(RaceContext* race) {
         if (race->quicDoneEvent) CloseHandle(race->quicDoneEvent);
         if (race->req) {
             if (race->req->body) HeapFree(heap, 0, race->req->body);
+            if (race->req->headers) HeapFree(heap, 0, race->req->headers);
             HeapFree(heap, 0, race->req);
         }
         HeapFree(heap, 0, race);
@@ -824,22 +829,45 @@ static int WriteQpackLiteralWithLiteralName(uint8_t* out, const char* name, cons
 // это отдельный протокол поверх QPACK. Вместо этого клиент объявляет
 // SETTINGS_QPACK_MAX_TABLE_CAPACITY=0 (см. Http3ThreadFunc), что по RFC 9204
 // обязывает и сервер не использовать динамическую таблицу в ответе.
-static int QpackEncodeRequestHeaders(uint8_t* out, const char* method, const char* path,
+// outCap — размер буфера out. Раньше предела не было вовсе: функция писала
+// сколько придётся, а вызывающий выделял 3072 байта и полагался на то, что
+// заголовки, обрезанные на 2040 символах, туда влезут. Обрезание сняли, значит
+// предел обязан быть явным - иначе вместо потери заголовков вышла бы порча кучи.
+// Перед каждой записью проверяется её худший размер; не помещается - заголовок
+// пропускается, а не затирает соседнюю память.
+static int QpackEncodeRequestHeaders(uint8_t* out, int outCap, const char* method, const char* path,
                                       const char* authority, const char* userAgent,
                                       const char* rawHeaders) {
     int pos = 0;
+    if (outCap < 2) return 0;
     out[pos++] = 0x00; // Required Insert Count = 0
     out[pos++] = 0x00; // Sign=0, Delta Base=0
 
+    // Худший размер одной записи: до 2 байт на индекс, до 5 на длину, плюс данные.
+#define QPACK_ZAPAS(dlina) ((dlina) + 12)
+
     int midx = QpackStaticMethodIndex(method);
-    if (midx >= 0) pos += WriteQpackIndexed(out + pos, midx);
-    else pos += WriteQpackLiteralWithLiteralName(out + pos, ":method", method);
+    if (midx >= 0) {
+        if (pos + QPACK_ZAPAS(0) > outCap) return pos;
+        pos += WriteQpackIndexed(out + pos, midx);
+    } else {
+        if (pos + QPACK_ZAPAS(MyStrLen(method) + 7) > outCap) return pos;
+        pos += WriteQpackLiteralWithLiteralName(out + pos, ":method", method);
+    }
 
-    if (MyStrCmp(path, "/") == 0) pos += WriteQpackIndexed(out + pos, QPACK_IDX_PATH_ROOT);
-    else pos += WriteQpackLiteralWithNameRef(out + pos, QPACK_IDX_PATH_ROOT, path);
+    if (MyStrCmp(path, "/") == 0) {
+        if (pos + QPACK_ZAPAS(0) > outCap) return pos;
+        pos += WriteQpackIndexed(out + pos, QPACK_IDX_PATH_ROOT);
+    } else {
+        if (pos + QPACK_ZAPAS(MyStrLen(path)) > outCap) return pos;
+        pos += WriteQpackLiteralWithNameRef(out + pos, QPACK_IDX_PATH_ROOT, path);
+    }
 
+    if (pos + QPACK_ZAPAS(0) > outCap) return pos;
     pos += WriteQpackIndexed(out + pos, QPACK_IDX_SCHEME_HTTPS);
+    if (pos + QPACK_ZAPAS(MyStrLen(authority)) > outCap) return pos;
     pos += WriteQpackLiteralWithNameRef(out + pos, QPACK_IDX_AUTHORITY, authority);
+    if (pos + QPACK_ZAPAS(MyStrLen(userAgent)) > outCap) return pos;
     pos += WriteQpackLiteralWithNameRef(out + pos, QPACK_IDX_USER_AGENT, userAgent);
 
     // Пользовательские заголовки из rawHeaders ("Key: Value\r\n...").
@@ -848,22 +876,34 @@ static int QpackEncodeRequestHeaders(uint8_t* out, const char* method, const cha
     // небольшим) размером стека — крупные локальные буферы там реально роняли процесс
     // (SIGSEGV, воспроизводилось против google.com, см. диагностику).
     void* heap = GetProcessHeap();
-    char* key = (char*)HeapAlloc(heap, 0, 256);
-    char* val = (char*)HeapAlloc(heap, 0, 1536);
-    int i = 0;
     int rawLen = MyStrLen(rawHeaders);
+    // Буферы под имя и значение — по длине всего набора: ни одна пара заведомо
+    // не длиннее его. Прежние 256 и 1536 обрезали длинные значения, а токен в
+    // Authorization подбирается к полутора килобайтам вплотную.
+    char* key = (char*)HeapAlloc(heap, 0, rawLen + 1);
+    char* val = (char*)HeapAlloc(heap, 0, rawLen + 1);
+    if (!key || !val) {
+        if (key) HeapFree(heap, 0, key);
+        if (val) HeapFree(heap, 0, val);
+        return pos;
+    }
+    int i = 0;
     while (i < rawLen) {
         int k = 0;
-        while (i < rawLen && rawHeaders[i] != ':' && k < 255) key[k++] = rawHeaders[i++];
+        while (i < rawLen && rawHeaders[i] != ':') key[k++] = rawHeaders[i++];
         key[k] = '\0';
         if (i < rawLen && rawHeaders[i] == ':') i++;
         if (i < rawLen && rawHeaders[i] == ' ') i++;
         int v = 0;
-        while (i < rawLen && rawHeaders[i] != '\r' && v < 1535) val[v++] = rawHeaders[i++];
+        while (i < rawLen && rawHeaders[i] != '\r') val[v++] = rawHeaders[i++];
         val[v] = '\0';
         while (i < rawLen && (rawHeaders[i] == '\r' || rawHeaders[i] == '\n')) i++;
-        if (k > 0) pos += WriteQpackLiteralWithLiteralName(out + pos, key, val);
+        if (k > 0) {
+            if (pos + QPACK_ZAPAS(k + v) > outCap) break;
+            pos += WriteQpackLiteralWithLiteralName(out + pos, key, val);
+        }
     }
+#undef QPACK_ZAPAS
     HeapFree(heap, 0, key);
     HeapFree(heap, 0, val);
 
@@ -1262,12 +1302,17 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
         MyIntToStr(state->port, authority + al);
     }
 
-    uint8_t* headersPayload = (uint8_t*)HeapAlloc(heap, 0, 3072);
-    int hlen = QpackEncodeRequestHeaders(headersPayload, req->method, state->path,
-                                          authority, "Solar2D-HTTP3-Plugin/1.0", req->headers);
+    // Размер буфера считается от входа, а не берётся числом: 12 байт служебных
+    // на каждую пару, пар не больше чем длина набора делить на три, плюс путь,
+    // авторитет и запас на псевдозаголовки.
+    int rawHlen = req->headers ? MyStrLen(req->headers) : 0;
+    int hcap = 512 + MyStrLen(state->path) + MyStrLen(authority) + rawHlen * 5;
+    uint8_t* headersPayload = (uint8_t*)HeapAlloc(heap, 0, hcap);
+    int hlen = QpackEncodeRequestHeaders(headersPayload, hcap, req->method, state->path,
+                                          authority, "Solar2D-HTTP3-Plugin/1.0", req->headers ? req->headers : "");
     HeapFree(heap, 0, authority);
 
-    state->sendBuf = (uint8_t*)HeapAlloc(heap, 0, 4096 + req->body_len + 16);
+    state->sendBuf = (uint8_t*)HeapAlloc(heap, 0, hlen + req->body_len + 64);
     int pos = WriteHttp3Frame(state->sendBuf, HTTP3_FRAME_HEADERS, headersPayload, hlen);
     HeapFree(heap, 0, headersPayload);
     int dataPos = pos;
@@ -1285,6 +1330,7 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
     }
 
     long sOpen = api->StreamOpen(c->connection, QUIC_STREAM_OPEN_FLAG_NONE, RequestStreamCallback, state, &state->requestStream);
+    LogHexVal("Http3OtpravitZapros: заголовки, Б", (unsigned long)(req->headers ? MyStrLen(req->headers) : 0));
     LogHexVal("Http3OtpravitZapros: тело запроса, Б", (unsigned long)req->body_len);
     LogHexVal("Http3OtpravitZapros: соединение", (unsigned long)(size_t)c);
     LogHexVal("Http3OtpravitZapros: StreamOpen", (unsigned long)sOpen);
@@ -1747,10 +1793,19 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     WinHttpSetTimeouts(hRequest, req->timeout_ms, req->timeout_ms,
                        req->timeout_ms, req->timeout_ms);
 
-    wchar_t w_headers[1024];
+    // Буфер под широкие символы — по фактической длине заголовков. Раньше
+    // было 1024, и набор длиннее обрезался здесь, даже если выше уцелел.
+    int w_headers_cap = (req->headers ? MyStrLen(req->headers) : 0) + 1;
+    wchar_t* w_headers = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, w_headers_cap * sizeof(wchar_t));
+    if (!w_headers) {
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
+        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "нет памяти под заголовки");
+        ReleaseRaceContext(race);
+        return 0;
+    }
     w_headers[0] = L'\0';
-    if (req->headers[0]) {
-        AnsiToWide(req->headers, w_headers, 1024);
+    if (req->headers && req->headers[0]) {
+        AnsiToWide(req->headers, w_headers, w_headers_cap);
     }
 
     if (race->winnerAssigned) {
@@ -1760,6 +1815,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
         ReleaseRaceContext(race);
         __sync_add_and_fetch(&g_TcpVPolyote, -1);
+        HeapFree(GetProcessHeap(), 0, w_headers);
         return 0;
     }
 
@@ -1780,6 +1836,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttp Send/Receive failed");
         ReleaseRaceContext(race);
         __sync_add_and_fetch(&g_TcpVPolyote, -1);
+        HeapFree(GetProcessHeap(), 0, w_headers);
         return 0;
     }
 
@@ -1847,6 +1904,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     WinHttpCloseHandle(hConnect);
     ReleaseRaceContext(race);
     __sync_add_and_fetch(&g_TcpVPolyote, -1);
+    HeapFree(GetProcessHeap(), 0, w_headers);
     return 0;
 }
 
@@ -1979,7 +2037,7 @@ static int initiateRequest( lua_State *L )
 
     req->method[0] = 'G'; req->method[1] = 'E'; req->method[2] = 'T'; req->method[3] = '\0';
     req->body_len = 0;
-    req->headers[0] = '\0';
+    // req->headers остаётся NULL, пока заголовки не разобраны: структура обнулена выше.
     req->timeout_ms = HTTP3_REQUEST_TIMEOUT_MS;   // умолчание, ниже перекроется параметром
     req->id = g_NextRequestId++;
 
@@ -2043,23 +2101,38 @@ static int initiateRequest( lua_State *L )
 
         lua_getfield(L, tbl_idx, "headers");
         if (lua_istable(L, -1)) {
-            int h_pos = 0;
+            // Два прохода: сначала считаем нужный размер, потом заполняем.
+            // Так набор заголовков не приходится ничем ограничивать.
+            int nuzhno = 1;
             lua_pushnil(L);
             while (lua_next(L, -2) != 0) {
                 const char* key = lua_tostring(L, -2);
                 const char* val = lua_tostring(L, -1);
-                if (key && val) {
-                    int k_idx = 0;
-                    while (key[k_idx] && h_pos < 2040) req->headers[h_pos++] = key[k_idx++];
-                    if (h_pos < 2040) req->headers[h_pos++] = ':';
-                    if (h_pos < 2040) req->headers[h_pos++] = ' ';
-                    int v_idx = 0;
-                    while (val[v_idx] && h_pos < 2040) req->headers[h_pos++] = val[v_idx++];
-                    if (h_pos < 2040) { req->headers[h_pos++] = '\r'; req->headers[h_pos++] = '\n'; }
-                }
+                // на каждую пару: имя, двоеточие, пробел, значение и конец строки
+                if (key && val) nuzhno += MyStrLen(key) + MyStrLen(val) + 4;
                 lua_pop(L, 1);
             }
-            req->headers[h_pos] = '\0';
+            req->headers = (char*)HeapAlloc(heap, 0, nuzhno);
+            int h_pos = 0;
+            if (req->headers) {
+                lua_pushnil(L);
+                while (lua_next(L, -2) != 0) {
+                    const char* key = lua_tostring(L, -2);
+                    const char* val = lua_tostring(L, -1);
+                    if (key && val) {
+                        int k_idx = 0;
+                        while (key[k_idx]) req->headers[h_pos++] = key[k_idx++];
+                        req->headers[h_pos++] = ':';
+                        req->headers[h_pos++] = ' ';
+                        int v_idx = 0;
+                        while (val[v_idx]) req->headers[h_pos++] = val[v_idx++];
+                        req->headers[h_pos++] = '\r';
+                        req->headers[h_pos++] = '\n';
+                    }
+                    lua_pop(L, 1);
+                }
+                req->headers[h_pos] = '\0';
+            }
         }
         lua_pop(L, 1);
     }
