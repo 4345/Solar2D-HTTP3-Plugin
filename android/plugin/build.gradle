@@ -26,6 +26,21 @@ dependencies {
 
 def buildDirectory = getLayout().getBuildDirectory().asFile.get()
 
+// ДВА РАЗНЫХ ИМЕНИ, и путать их нельзя - именно на этом задача выкладки молча
+// промахивалась мимо цели.
+//   imyaModulya - имя Lua-модуля и Java-пакета загрузчика:
+//                 require("plugin.http3.ntv") -> класс plugin.http3.ntv.LuaLoader.
+//                 Им называется извлекаемый jar.
+//   imyaPlagina - имя плагина в build.settings приложения. Именно ПО НЕМУ
+//                 Solar2D ищет локальную копию:
+//                 Solar2DPlugins/<издатель>/<имя плагина>/<платформа>/data.tgz
+//                 (см. ReadMe.md, «Способ 2»). В каталог с именем модуля
+//                 Solar2D не заглядывает вовсе.
+// Объявлены ДО задач: замыкание Groovy захватывает только те переменные,
+// которые объявлены выше него.
+def imyaModulya = 'plugin.http3.ntv'
+def imyaPlagina = 'plugin.http3'
+
 // "ТОЛСТЫЙ" AAR БОЛЬШЕ НЕ НУЖЕН И УДАЛЁН.
 // Он существовал ровно затем, чтобы протащить kotlin-stdlib внутрь classes.jar:
 // Solar2D извлекает из AAR только classes.jar и не разрешает его transitive-
@@ -45,8 +60,7 @@ tasks.register("extractPluginJar") {
             }
             into "$buildDirectory/outputs/"
             // Имя пакета плагина в Solar2D
-            String packageName = "plugin.http3.ntv"
-            rename "classes.jar", "${packageName}.jar"
+            rename "classes.jar", "${imyaModulya}.jar"
         }
     }
 }
@@ -56,16 +70,11 @@ tasks.register("extractPluginJar") {
 // to retrieve plugins, so will overshadow online directory/store downloads.
 // Идентификатор издателя (publisherId)
 def providerId = 'ovh.azi'
+
 tasks.register("deployToLocalSolar2DRepo", Tar) {
     group "Solar2Dev"
 
     dependsOn assembleRelease
-
-    File pluginManifestFile = file("src/main/AndroidManifest.xml")
-    String manifestContents = pluginManifestFile.text
-    def pluginManifestXml = new XmlSlurper().parseText(manifestContents)
-    // Имя пакета плагина в Solar2D
-    String packageName = "plugin.http3.ntv"
 
     compression = Compression.GZIP
     archiveFileName = "data.tgz"
@@ -76,7 +85,7 @@ tasks.register("deployToLocalSolar2DRepo", Tar) {
     } else {
         rootS2DP = System.getenv("USERPROFILE") ?: System.getProperty("user.home")
     }
-    def dst = file("$rootS2DP/Solar2DPlugins/$providerId/$packageName/android")
+    def dst = file("$rootS2DP/Solar2DPlugins/$providerId/$imyaPlagina/android")
     destinationDirectory = dst
 
     // Упаковываем обычную AAR: посторонних классов в ней нет, только сам плагин.
