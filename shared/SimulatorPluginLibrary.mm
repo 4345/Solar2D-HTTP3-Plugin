@@ -88,6 +88,10 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
 
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSURLSessionDataTask *> *activeTasks;
+// Согласованный протокол по идентификатору задачи. Заполняется в
+// URLSession:task:didFinishCollectingMetrics: — единственном месте, где
+// NSURLSession сообщает, ЧТО он на самом деле использовал.
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *protokolZadachi;
 @property (nonatomic, assign) NSInteger nextRequestId;
 @property (nonatomic, assign) int64_t totalCompleted;
 @property (nonatomic, assign) int64_t totalFailed;
@@ -125,6 +129,7 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
     self = [super init];
     if (self) {
         _activeTasks = [[NSMutableDictionary alloc] init];
+        _protokolZadachi = [[NSMutableDictionary alloc] init];
         _nextRequestId = 1;
         _totalCompleted = 0;
         _totalFailed = 0;
@@ -143,15 +148,38 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
         config.URLCredentialStorage = nil;
         config.HTTPCookieStorage = nil;
 
-        // Включение подсказки HTTP/3 на уровне конфигурации сессии (iOS 15+ / macOS 12+)
-        if ([config respondsToSelector:NSSelectorFromString(@"setAssumesHTTP3Capable:")]) {
-            [config setValue:@YES forKey:@"assumesHTTP3Capable"];
+        // Свойство assumesHTTP3Capable принадлежит ЗАПРОСУ, а не конфигурации
+        // сессии. Здесь стояла попытка выставить его на конфигурации по строке
+        // через KVC: проверка respondsToSelector не проходила, блок не
+        // выполнялся, и _isHTTP3Configured навсегда оставался NO — при том что
+        // HTTP/3 работал. Отчёт getMemoryStats попросту врал.
+        // Настоящую работу делает установка свойства на каждом запросе, см.
+        // requestWithURL ниже; флаг отражает именно её доступность.
+        if (@available(iOS 15.0, macOS 12.0, *)) {
             _isHTTP3Configured = YES;
         }
 
         _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
     }
     return self;
+}
+
+// Метрики задачи: отсюда берётся ИМЯ СОГЛАСОВАННОГО ПРОТОКОЛА. Раньше плагин
+// его не спрашивал вовсе и всегда сообщал в событие строку HTTP/3 — независимо
+// от того, что реально было на проводе. Диагностическая ценность такого поля
+// нулевая, а вред прямой: точно такую же поломку, какую на Windows нашли по
+// полю transport (все POST месяцами уходили по HTTP/1.1), на iOS не увидели бы
+// вовсе. Вызывается до обработчика завершения, в том числе для задач с
+// completionHandler.
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didFinishCollectingMetrics:(NSURLSessionTaskMetrics *)metrics {
+    NSString *imya = metrics.transactionMetrics.lastObject.networkProtocolName;
+    if (imya.length > 0) {
+        @synchronized (self) {
+            self.protokolZadachi[@(task.taskIdentifier)] = imya;
+        }
+    }
 }
 
 // Запрос мгновенного использования физической памяти процесса (Resident Set Size)
@@ -222,6 +250,10 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
         lua_State *mainLuaState = SafeGetCoronaThread(L);
 
         __weak __typeof__(self) weakSelf = self;
+        // Идентификатор задачи нужен в обработчике, чтобы забрать метрику с
+        // именем согласованного протокола. Сама задача создаётся ниже, поэтому
+        // ссылка объявлена __block и заполняется после создания.
+        __block NSURLSessionDataTask *ssylkaNaZadachu = nil;
         NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
             // Использование @autoreleasepool внутри фонового блока для немедленного освобождения объектовых ресурсов
             @autoreleasepool {
@@ -233,7 +265,28 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
                 }
 
                 NSInteger statusCode = 0;
-                NSString *protocol = @"HTTP/3 (QUIC / h3)";
+
+                // Протокол берётся из метрики задачи, а не выдумывается. Если
+                // метрика не пришла, так и сообщаем — врать про HTTP/3 нельзя,
+                // на этом поле держится вся диагностика транспорта.
+                NSString *imyaProtokola = nil;
+                if (ssylkaNaZadachu) {
+                    NSNumber *klyuch = @(ssylkaNaZadachu.taskIdentifier);
+                    @synchronized (strongSelf) {
+                        imyaProtokola = strongSelf.protokolZadachi[klyuch];
+                        if (imyaProtokola) [strongSelf.protokolZadachi removeObjectForKey:klyuch];
+                    }
+                }
+                NSString *protocol;
+                if ([imyaProtokola hasPrefix:@"h3"]) {
+                    protocol = [NSString stringWithFormat:@"HTTP/3 (QUIC / %@)", imyaProtokola];
+                } else if ([imyaProtokola hasPrefix:@"h2"]) {
+                    protocol = [NSString stringWithFormat:@"HTTP/2.0 (%@)", imyaProtokola];
+                } else if (imyaProtokola.length > 0) {
+                    protocol = [NSString stringWithFormat:@"HTTP (%@)", imyaProtokola];
+                } else {
+                    protocol = @"HTTP (протокол не сообщён)";
+                }
                 NSString *transport = @"Native Apple Network.framework (NSURLSession)";
                 NSMutableDictionary *respHeaders = [NSMutableDictionary dictionary];
 
@@ -250,7 +303,7 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
                 NSUInteger responseLen = 0;
 
                 if (data && data.length > 0) {
-                    strongSelf.totalBytesReceived += data.length;
+                    @synchronized (strongSelf) { strongSelf.totalBytesReceived += data.length; }
                     responseLen = data.length;
                     responseBuf = malloc(responseLen);
                     if (responseBuf) {
@@ -260,13 +313,19 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
                     }
                 }
 
-                BOOL isError = (error != nil || statusCode >= 400);
-                NSString *errorDesc = error ? error.localizedDescription : (statusCode >= 400 ? [NSString stringWithFormat:@"HTTP Error %ld", (long)statusCode] : nil);
+                // isError — ТОЛЬКО про сбой транспорта, как у network.request в
+                // Solar2D и как в версии для Windows. Код 4xx/5xx это нормально
+                // доставленный ответ: он приезжает в status, а разбирает его
+                // вызывающий. Раньше здесь стояло (error || statusCode >= 400),
+                // и ответ 401 выглядел для вызывающего обрывом связи — в
+                // частности, обновление истёкшего токена по коду 401 не
+                // срабатывало вовсе.
+                BOOL isError = (error != nil);
+                NSString *errorDesc = error ? error.localizedDescription : nil;
 
-                if (isError) {
-                    strongSelf.totalFailed++;
-                } else {
-                    strongSelf.totalCompleted++;
+                @synchronized (strongSelf) {
+                    if (isError) strongSelf.totalFailed++;
+                    else strongSelf.totalCompleted++;
                 }
 
                 // Перенос передачи результата в главный поток Corona Lua
@@ -337,6 +396,7 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
             }
         }];
 
+        ssylkaNaZadachu = task;
         @synchronized (self) {
             self.activeTasks[reqIdNum] = task;
         }
@@ -373,6 +433,7 @@ static int L_request(lua_State *L) {
     NSData *bodyData = nil;
     NSTimeInterval timeout = 3.0;
     int listenerIdx = 0;
+    int tablicaIdx = 0;   // где лежит таблица параметров, если она есть
 
     // 1. Определение параметров по типам аргументов
     if (lua_isstring(L, 2)) {
@@ -381,6 +442,7 @@ static int L_request(lua_State *L) {
         listenerIdx = 3;
 
         if (lua_istable(L, 4)) {
+            tablicaIdx = 4;
             lua_getfield(L, 4, "timeout");
             if (lua_isnumber(L, -1)) timeout = lua_tonumber(L, -1);
             lua_pop(L, 1);
@@ -409,6 +471,7 @@ static int L_request(lua_State *L) {
         }
     } else if (lua_istable(L, 2)) {
         // Сигнатура с передачей таблицы параметров 2-м аргументом: (url, params, listener)
+        tablicaIdx = 2;
         lua_getfield(L, 2, "method");
         if (lua_isstring(L, -1)) method = [NSString stringWithUTF8String:lua_tostring(L, -1)];
         lua_pop(L, 1);
@@ -442,10 +505,39 @@ static int L_request(lua_State *L) {
         listenerIdx = 3;
     } else {
         // Сигнатура с пропущенным методом: (url, listener [, params])
+        // Раньше отсюда читался ТОЛЬКО timeout: метод, тело и заголовки
+        // терялись молча, и запрос уходил пустым GET без единого заголовка.
         listenerIdx = 2;
         if (lua_istable(L, 3)) {
+            tablicaIdx = 3;
+            lua_getfield(L, 3, "method");
+            if (lua_isstring(L, -1)) method = [NSString stringWithUTF8String:lua_tostring(L, -1)];
+            lua_pop(L, 1);
+
             lua_getfield(L, 3, "timeout");
             if (lua_isnumber(L, -1)) timeout = lua_tonumber(L, -1);
+            lua_pop(L, 1);
+
+            lua_getfield(L, 3, "body");
+            if (lua_isstring(L, -1)) {
+                size_t len = 0;
+                const char *bytes = lua_tolstring(L, -1, &len);
+                bodyData = [NSData dataWithBytes:bytes length:len];
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, 3, "headers");
+            if (lua_istable(L, -1)) {
+                NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+                lua_pushnil(L);
+                while (lua_next(L, -2) != 0) {
+                    if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
+                        dict[[NSString stringWithUTF8String:lua_tostring(L, -2)]] = [NSString stringWithUTF8String:lua_tostring(L, -1)];
+                    }
+                    lua_pop(L, 1);
+                }
+                headers = dict;
+            }
             lua_pop(L, 1);
         }
     }
@@ -453,6 +545,22 @@ static int L_request(lua_State *L) {
     CoronaLuaRef listenerRef = NULL;
     if (lua_isfunction(L, listenerIdx) || lua_istable(L, listenerIdx)) {
         listenerRef = SafeCoronaLuaNewRef(L, listenerIdx);
+    } else if (tablicaIdx > 0) {
+        // Слушатель может лежать полем в самой таблице параметров — так его
+        // передаёт initiateRequest(url, params). Раньше это поле не читалось
+        // вовсе, и при такой сигнатуре обратного вызова не было никогда.
+        lua_getfield(L, tablicaIdx, "listener");
+        if (lua_isfunction(L, -1) || lua_istable(L, -1)) {
+            listenerRef = SafeCoronaLuaNewRef(L, lua_gettop(L));
+        }
+        lua_pop(L, 1);
+    }
+
+    if (listenerRef == NULL) {
+        // Без слушателя запрос бессмысленен: вызывающий получил бы номер и
+        // тишину. Раньше он в этом случае всё равно уходил в сеть.
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     HTTP3PluginManager *mgr = [HTTP3PluginManager sharedInstance];
