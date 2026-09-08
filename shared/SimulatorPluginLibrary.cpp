@@ -489,6 +489,27 @@ static void ReleaseRaceContext(RaceContext* race) {
 }
 
 // Завершение гонки и фиксация результата. Публикует результат в AddResult без прямого освобождения race.
+// ===========================================================================
+// ЗАКРЫТИЕ ЗАПАСНОГО СЕАНСА TCP, КОГДА QUIC ДОКАЗАЛ УСТОЙЧИВОСТЬ.
+//
+// Сеанс WinHTTP общий на весь процесс и держит свои соединения живыми. TCP у
+// нас запасной: он поднимается, когда QUIC не успел, и после этого соединение
+// висит до конца сеанса, отвечая на keep-alive. По снятому дампу так и было -
+// два соединения обслужили по одному запросу на двенадцатой секунде, а дальше
+// из 62 их пакетов данные несли 17, остальное служебное; закрыл их в итоге сам
+// сервер спустя полторы минуты.
+//
+// Отключать keep-alive совсем неправильно: если QUIC заблокируют и TCP станет
+// основным путём, каждый запрос будет платить рукопожатие. Поэтому сеанс живёт,
+// пока нужен, и закрывается, когда QUIC подряд выигрывает достаточно раз -
+// вместе с сеансом уходят и его соединения. Понадобится снова - поднимется
+// заново, см. GetGlobalWinHttpSession.
+// ===========================================================================
+#define POBED_QUIC_DLYA_ZAKRYTIYA_TCP 5
+static volatile long g_PobedQuicPodryad = 0;
+static volatile long g_TcpVPolyote = 0;
+static void ZakrytSeansTcpEsliPora(void);
+
 static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
                         const char* data, int len, const char* transport, const char* errMsg) {
     if (outcome == RACE_SUCCESS) {
@@ -497,6 +518,8 @@ static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
         if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
         if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 1)) {
             AddResult(race->req->id, 0, status, data, len, transport);
+            __sync_add_and_fetch(&g_PobedQuicPodryad, 1);
+            ZakrytSeansTcpEsliPora();
         }
     } else if (outcome == RACE_FAILURE) {
         race->quicSuccess = 0;
@@ -1626,15 +1649,39 @@ static HINTERNET GetGlobalWinHttpSession() {
     return g_hWinHttpSession;
 }
 
+// Закрывает сеанс WinHTTP, если QUIC подряд выигрывает и ни одного запроса по
+// TCP сейчас не выполняется. Закрытие дескриптора сеанса уносит и удерживаемые
+// им соединения — вместе с их keep-alive.
+static void ZakrytSeansTcpEsliPora(void) {
+    if (g_PobedQuicPodryad < POBED_QUIC_DLYA_ZAKRYTIYA_TCP) return;
+    if (g_TcpVPolyote > 0) return;
+    HINTERNET seans = NULL;
+    EnterCriticalSection(&g_CritSec);
+    // Повторная проверка под замком: между проверкой выше и захватом замка
+    // запрос по TCP мог начаться.
+    if (g_hWinHttpSession && g_TcpVPolyote == 0) {
+        seans = g_hWinHttpSession;
+        g_hWinHttpSession = NULL;
+    }
+    LeaveCriticalSection(&g_CritSec);
+    if (seans) {
+        WinHttpCloseHandle(seans);
+        LogMsg("Запасной сеанс TCP закрыт: QUIC устойчиво выигрывает");
+    }
+}
+
 static unsigned long __stdcall Http1ThreadFunc(void* param) {
     RaceContext* race = (RaceContext*)param;
     AsyncRequestContext* req = race->req;
     LogMsg("Http1ThreadFunc: Фоновый поток успешно запущен");
+    // Пока счётчик не ноль, сеанс WinHTTP закрывать нельзя: им пользуются.
+    __sync_add_and_fetch(&g_TcpVPolyote, 1);
 
     if (race->winnerAssigned) {
         LogMsg("Http1ThreadFunc: MsQuic/HTTP3 уже победил, пропускаем WinHttp");
         RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1646,6 +1693,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     if (!ParseUrl(req->url, host, sizeof(host), &port, path, sizeof(path), &secure)) {
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "Невалидный URL");
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1654,6 +1702,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         LogMsg("Http1ThreadFunc: WinHttpOpen failed");
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttpOpen failed");
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1663,6 +1712,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     if (!hConnect) {
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttpConnect failed");
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1677,6 +1727,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         WinHttpCloseHandle(hConnect);
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttpOpenRequest failed");
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1699,6 +1750,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         WinHttpCloseHandle(hConnect);
         RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1718,6 +1770,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         WinHttpCloseHandle(hConnect);
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttp Send/Receive failed");
         ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
         return 0;
     }
 
@@ -1774,6 +1827,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         LogMsg("Http1ThreadFunc: QUIC успешно завершился (QUIC победил по Happy Eyeballs v3), отменяем TCP результат");
     } else {
         LogMsg("Http1ThreadFunc: QUIC дал сбой или таймаут, TCP побеждает по Happy Eyeballs v3");
+        g_PobedQuicPodryad = 0;   // полоса побед QUIC прервана
         if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 2)) {
             AddResult(race->req->id, 0, status_val, resp_buf, resp_len, transport_name);
         }
@@ -1783,6 +1837,7 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     ReleaseRaceContext(race);
+    __sync_add_and_fetch(&g_TcpVPolyote, -1);
     return 0;
 }
 

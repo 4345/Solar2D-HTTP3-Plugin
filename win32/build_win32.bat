@@ -21,6 +21,7 @@ if exist "%~dp0..\plugins\win32-sim" (
 if errorlevel 1 goto :sboy_vykladki
     pushd "%~dp0Release"
     tar -czf "%~dp0..\plugins\win32-sim\data.tgz" plugin_http3_native.dll
+if errorlevel 1 goto :sboy_vykladki
     popd
 )
 
@@ -29,6 +30,7 @@ if exist "%~dp0..\plugins\win32" (
 if errorlevel 1 goto :sboy_vykladki
     pushd "%~dp0Release"
     tar -czf "%~dp0..\plugins\win32\data.tgz" plugin_http3_native.dll
+if errorlevel 1 goto :sboy_vykladki
     popd
 )
 
@@ -37,6 +39,7 @@ if exist "%~dp0..\plugins\lua" (
 if errorlevel 1 goto :sboy_vykladki
     pushd "%~dp0..\lua"
     tar -czf "%~dp0..\plugins\lua\data.tgz" plugin_http3.lua
+if errorlevel 1 goto :sboy_vykladki
     popd
 )
 
@@ -47,6 +50,7 @@ for /d %%D in ("%APPDATA%\Solar2DPlugins\*") do (
 if errorlevel 1 goto :sboy_vykladki
         pushd "%~dp0Release"
         tar -czf "%%D\plugin.http3\win32-sim\data.tgz" plugin_http3_native.dll
+if errorlevel 1 goto :sboy_vykladki
         popd
     )
     if exist "%%D\plugin.http3\win32" (
@@ -54,6 +58,7 @@ if errorlevel 1 goto :sboy_vykladki
 if errorlevel 1 goto :sboy_vykladki
         pushd "%~dp0Release"
         tar -czf "%%D\plugin.http3\win32\data.tgz" plugin_http3_native.dll
+if errorlevel 1 goto :sboy_vykladki
         popd
     )
     if exist "%%D\plugin.http3\lua" (
@@ -61,6 +66,7 @@ if errorlevel 1 goto :sboy_vykladki
 if errorlevel 1 goto :sboy_vykladki
         pushd "%~dp0..\lua"
         tar -czf "%%D\plugin.http3\lua\data.tgz" plugin_http3.lua
+if errorlevel 1 goto :sboy_vykladki
         popd
     )
 )
