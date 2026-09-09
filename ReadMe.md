@@ -153,6 +153,20 @@ cd android && ./gradlew :plugin:deployToLocalSolar2DRepo
 Она кладёт архив по имени плагина из `build.settings` — то есть в
 `plugin.http3/android`, откуда Solar2D его и читает. Копировать вручную не надо.
 
+**Архивы платформ.** Solar2D берёт при сборке ИМЕННО `data.tgz`, а не файлы
+рядом с ним, поэтому после правки любого файла платформы архив надо пересобрать:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\sobrat_arhivy.ps1
+```
+
+Скрипт собирает `win32`, `win32-sim`, `android` и `lua` из файлов каталога и
+следит за главным: в каждом архиве должна лежать Lua-обёртка `plugin_http3.lua`
+— модуль плагина называется `plugin.http3`, и это именно она (нативная часть
+объявляет `plugin.http3.ntv`, а не `plugin.http3`). Apple-архивы устроены иначе
+и собираются `Apple/deployLocal.sh`, их скрипт только проверяет. Ключ
+`-Proverit` показывает состав всех архивов, ничего не пересобирая.
+
 **Чем собирать.** Нужен JDK 17 (проверено) — им же располагает и сама Solar2D:
 `<Solar2D>/Corona/jre`. На JDK 25 сборка падает ещё на конфигурации, с
 `IllegalArgumentException: 25.0.3` из `JavaVersion.parse`: компилятор Kotlin,
@@ -306,6 +320,8 @@ Solar2D-HTTP3-Plugin/
 │   └── plugin/src/main/java/plugin/http3/
 │       ├── ntv/LuaLoader.java      # Загрузчик, который ищет Solar2D по имени модуля
 │       └── native_stub/LuaLoaderInternal.java  # Реализация на Cronet
+├── tools/
+│   └── sobrat_arhivy.ps1           # Пересборка data.tgz платформ из файлов рядом с ним
 ├── Apple/                          # Скрипты сборки Xcode, Makefile и deployLocal.sh
 ├── test_app/                       # Универсальное тестовое Solar2D-приложение
 │   ├── main.lua                    # Дашборд проверки метрик памяти и пачек из 50 запросов
