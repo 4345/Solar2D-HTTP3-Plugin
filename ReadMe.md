@@ -41,9 +41,8 @@
 байты, — но в режиме отката передаётся дальше, потому что без него Solar2D
 отправляет тело как текст в UTF-8 и портит двоичные данные.
 
-Через откат передаются и остальные параметры `network.request`, а не только
-`headers`/`body`/`timeout`: `bodyType`, `progress`, `response`,
-`handleRedirects`.
+В режиме отката передаются все параметры запроса: помимо `headers`, `body` и
+`timeout` — `bodyType`, `progress`, `response`, `handleRedirects`.
 
 **Умолчание `timeout` — 3 секунды** (в `network.request` — 30). Такого ожидания
 не требует ни один сценарий, а в iOS/macOS 3 секунды приняты стандартом для
@@ -52,24 +51,12 @@ HTTP/3.
 ### 4. Имя нативного модуля: `plugin.http3.ntv`
 
 Solar2D ищет загрузчик по имени требуемого модуля: `require("a.b.c")` → класс
-`a.b.c.LuaLoader`. Прежнее имя `plugin.http3.native` заставляло держать
-загрузчик на Kotlin: пакет с сегментом `native` javac собрать не может, это
-ключевое слово Java. Ради Kotlin в AAR подмешивался весь `kotlin-stdlib`, и
-сборка приложения, где Kotlin уже есть, падала:
+`a.b.c.LuaLoader`. Нативный модуль плагина называется `plugin.http3.ntv`:
+сегмент `native` в имени пакета невозможен, это ключевое слово Java. Загрузчик
+написан на Java, Kotlin в плагине не используется.
 
-```
-Duplicate class kotlin.ArrayIntrinsicsKt found in modules
-kotlin-stdlib-2.1.0.jar and plugin-release.aar
-```
-
-Пакет переименован в `plugin.http3.ntv`, загрузчик переписан на Java, Kotlin из
-плагина убран целиком. AAR похудел с 1 609 344 до 19 385 байт.
-
-Lua-модуль ищет нативный модуль по списку имён: сначала `plugin.http3.ntv`,
-затем прежнее `plugin.http3.native` — готовые бинарники Apple и Windows
-экспортируют `luaopen_plugin_http3_native`. Точки входа
-`luaopen_plugin_http3_ntv` в их исходники добавлены, так что после пересборки
-запасное имя можно будет убрать.
+Lua-модуль пробует два имени: сначала `plugin.http3.ntv`, затем
+`plugin.http3.native` — второе экспортируют готовые бинарники Apple и Windows.
 
 ---
 
@@ -165,10 +152,6 @@ cd android && ./gradlew :plugin:deployToLocalSolar2DRepo
 
 Она кладёт архив по имени плагина из `build.settings` — то есть в
 `plugin.http3/android`, откуда Solar2D его и читает. Копировать вручную не надо.
-
-> Раньше задача клала архив в каталог `plugin.http3.ntv` — по имени нативного
-> МОДУЛЯ, а не плагина. Отказа при этом не было: задача сообщала об успехе, а
-> сборка молча продолжала брать прежнюю копию. Исправлено.
 
 **Чем собирать.** Нужен JDK 17 (проверено) — им же располагает и сама Solar2D:
 `<Solar2D>/Corona/jre`. На JDK 25 сборка падает ещё на конфигурации, с
