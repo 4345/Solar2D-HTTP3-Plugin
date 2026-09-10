@@ -36,3 +36,13 @@ desktop.ini
 local.properties
 obj/
 win32/Stend/
+
+# MsQuic рядом с архивами платформ: это артефакт сборки стенда, а не файл
+# плагина. Попав под контроль версий, он тут же уехал бы в win32-архив -
+# sobrat_arhivy.ps1 пакует именно отслеживаемое.
+plugins/win32/msquic.dll
+plugins/win32-sim/msquic.dll
+test_app/msquic.dll
+win32/msquic.dll
+win32/Release/msquic.dll
+win32/Release/lua.dll
