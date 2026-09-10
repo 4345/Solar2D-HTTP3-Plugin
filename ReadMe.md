@@ -275,6 +275,40 @@ end, {
 передаётся в `network.request` дальше. Подробнее — раздел «Двоичные данные и
 `bodyType`» выше.
 
+### 2б. Скачивание и выгрузка файлов с прогрессом
+
+`http3.download` и `http3.upload` повторяют аргументы `network.download` и
+`network.upload` из Solar2D, поэтому подменяются в существующем коде один к
+одному:
+
+```lua
+http3.download("https://example.com/avatar.jpg", "GET", function(event)
+    if event.phase == "progress" then
+        print(("принято %d из %d"):format(event.bytesTransferred, event.bytesEstimated))
+    elseif event.phase == "ended" and not event.isError then
+        print("файл сохранён")
+    end
+end, { progress = true }, "avatar.jpg", system.DocumentsDirectory)
+```
+
+События хода передачи (`began` / `progress` / `ended` с `bytesTransferred` и
+`bytesEstimated`) шлёт **нативный слой**, и есть они там, где доставка идёт
+push-коллбэком — сейчас это Android. `bytesEstimated = -1` означает «сервер не
+сообщил Content-Length» — ровно как в Solar2D; полосу в этом случае рисовать не
+по чему.
+
+Опросный слой Windows промежуточных значений не имеет по устройству: он отдаёт
+только готовый результат. Чтобы вызывающий не гадал, есть функция:
+
+```lua
+if http3.progress_podderzhivaetsya() then ... end
+```
+
+Скачанное тело сохраняет в файл сама обёртка — потоковой записи на диск в
+нативных слоях нет. Для файлов размером в сотни килобайт это безопасно и даёт
+один и тот же код на всех платформах; прогресс при этом не теряется, он идёт
+из нативного слоя по мере приёма.
+
 ### 3. Отмена выполняющегося запроса (`cancel`)
 
 ```lua

@@ -1,42 +1,38 @@
-# Исключения Git для проекта плагина Solar2D HTTP/3
-
-# Временные файлы компиляции C/C++ и Visual Studio
-*.obj
-*.tlog
-*.pdb
-*.idb
-*.exp
-*.ilk
-*.aps
-*.ncb
-*.user
-*.suo
-*.VC.db
-UpgradeLog.htm
-*.pcapng
-
-# Логи и временные файлы сборки
-*.log
-*.tmp
-.vs/
-bin/
-obj/
 
 # Временные артефакты Gradle и Android
-.gradle/
-android/build/
-android/.gradle/
-android/plugin/build/kotlin/
-android/plugin/build/tmp/
-android/plugin/build/reports/
-
-# Промежуточные кэши ОС
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Промежуточные файлы сборки стенда (в игру не идут)
-win32/Stend/
-
+# Временные файлы компиляции C/C++ и Visual Studio
 # Иконочные каталоги, которые пересоздаёт симулятор
+# Исключения Git для проекта плагина Solar2D HTTP/3
+# Логи и временные файлы сборки
+# Промежуточные кэши ОС
+# Промежуточные файлы сборки стенда (в игру не идут)
+*.VC.db
+*.aps
+*.exp
+*.idb
+*.ilk
+*.log
+*.ncb
+*.obj
+*.pcapng
+*.pdb
+*.suo
+*.tlog
+*.tmp
+*.user
+.DS_Store
+.gradle/
+.vs/
 Images.xcassets/
+Thumbs.db
+UpgradeLog.htm
+android/.gradle/
+android/build/
+android/plugin/build/kotlin/
+android/plugin/build/reports/
+android/plugin/build/tmp/
+bin/
+desktop.ini
+local.properties
+obj/
+win32/Stend/

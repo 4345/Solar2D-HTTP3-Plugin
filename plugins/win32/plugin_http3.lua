@@ -132,6 +132,16 @@ nativeLib = loadNativeLibrary()
 -------------------------------------------------------------------------------
 -- Основная функция запроса: http3.request( url, method, listener [, params] )
 -------------------------------------------------------------------------------
+--- Вызов слушателя в обеих формах, которые допускает Solar2D: функция и
+-- таблица с методом. Вынесено, чтобы download/upload не повторяли разбор.
+local function vyzvat_slushatelya(listener, event)
+    if type(listener) == "function" then
+        return listener(event)
+    elseif type(listener) == "table" and type(listener.http3Response) == "function" then
+        return listener:http3Response(event)
+    end
+end
+
 function M.request(url, method, listener, params)
     if not url then
         error("HTTP3 Error: url является обязательным параметром", 2)
@@ -385,6 +395,113 @@ function M.pumpEvents(seconds)
             listenersToCall[i]()
         end
     end
+end
+
+--- Умеет ли нативный слой события хода передачи (began / progress).
+--
+-- Отвечает по РЕЖИМУ ДОСТАВКИ, а не по платформе. Слои с push-коллбэком
+-- (Android/Cronet, Apple/NSURLSession) сообщают о ходе передачи по мере
+-- приёма и отправки. Слой с опросом (Windows: cLib.checkRequest) отдаёт
+-- только готовый результат — промежуточных значений у него нет вовсе, и
+-- честнее сказать об этом вызывающему, чем молчать и не слать событий.
+--
+-- Вызывающему это нужно, чтобы решить, куда вести запрос с params.progress:
+-- туда, где прогресс будет, или на network.request Solar2D.
+function M.progress_podderzhivaetsya()
+    local cLib = loadNativeLibrary()
+    if not cLib then return false end
+    return cLib.checkRequest == nil
+end
+
+--- Скачивание файла: те же аргументы, что у network.download в Solar2D.
+-- @param url строка
+-- @param method строка ("GET")
+-- @param listener функция или таблица со слушателем
+-- @param params таблица параметров (headers, timeout, progress...)
+-- @param filename имя файла назначения
+-- @param baseDirectory каталог Solar2D (по умолчанию DocumentsDirectory)
+--
+-- ПОЧЕМУ ПОВЕРХ request. Нативные слои отдают тело ответа целиком, одним
+-- куском — потоковой записи на диск в них нет. Держать тело в памяти для
+-- файлов такого размера (сотни килобайт), безопасно, а код
+-- получается один на все платформы. Прогресс при этом НЕ теряется: события
+-- began/progress приходят из нативного слоя по мере приёма, и вызывающий
+-- получает их как обычно.
+function M.download(url, method, listener, params, filename, baseDirectory)
+    local p = {}
+    for k, v in pairs(params or {}) do p[k] = v end
+    local katalog = baseDirectory
+    if katalog == nil and system and system.DocumentsDirectory then
+        katalog = system.DocumentsDirectory
+    end
+
+    local function slushatel_zapisi(event)
+        -- Промежуточные события отдаём как есть: файла ещё нет, писать нечего.
+        if event and event.phase ~= nil and event.phase ~= "ended" then
+            return vyzvat_slushatelya(listener, event)
+        end
+        if event and not event.isError and type(event.response) == "string"
+                and filename and system and system.pathForFile then
+            local put = system.pathForFile(filename, katalog)
+            local fh = put and io.open(put, "wb")
+            if fh then
+                fh:write(event.response)
+                fh:close()
+                event.filename = filename
+                event.baseDirectory = katalog
+                -- bytesTransferred у завершения ставит нативный слой; если его
+                -- нет (откат на network.request), считаем по длине тела.
+                if event.bytesTransferred == nil then
+                    event.bytesTransferred = #event.response
+                end
+            else
+                event.isError = true
+                event.response = "не удалось открыть для записи: " .. tostring(put)
+            end
+        end
+        return vyzvat_slushatelya(listener, event)
+    end
+
+    return M.request(url, method or "GET", slushatel_zapisi, p)
+end
+
+--- Выгрузка файла: те же аргументы, что у network.upload в Solar2D.
+-- Файл читается целиком и уходит телом запроса; bodyType выставляется
+-- двоичным, иначе откат на network.request перекодирует байты в UTF-8 и
+-- испортит их.
+function M.upload(url, method, listener, params, filename, baseDirectory, contentType)
+    local p = {}
+    for k, v in pairs(params or {}) do p[k] = v end
+    local katalog = baseDirectory
+    if katalog == nil and system and system.DocumentsDirectory then
+        katalog = system.DocumentsDirectory
+    end
+
+    local put = (filename and system and system.pathForFile)
+        and system.pathForFile(filename, katalog) or nil
+    local fh = put and io.open(put, "rb")
+    if not fh then
+        -- Отвечаем ошибкой ТЕМ ЖЕ способом, что и сеть: вызывающий разбирает
+        -- один вид события, а не два.
+        local event = { name = "http3", isError = true, phase = "ended",
+                        response = "файл не найден: " .. tostring(put),
+                        bytesTransferred = 0, bytesEstimated = 0 }
+        if timer and timer.performWithDelay then
+            timer.performWithDelay(1, function() vyzvat_slushatelya(listener, event) end)
+        else
+            vyzvat_slushatelya(listener, event)
+        end
+        return nil
+    end
+    p.body = fh:read("*a")
+    fh:close()
+    p.bodyType = "binary"
+    if contentType then
+        p.headers = p.headers or {}
+        p.headers["Content-Type"] = contentType
+    end
+
+    return M.request(url, method or "POST", listener, p)
 end
 
 return M

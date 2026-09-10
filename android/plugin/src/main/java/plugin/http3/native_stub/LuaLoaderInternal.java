@@ -249,6 +249,7 @@ public class LuaLoaderInternal implements JavaFunction {
             // JNLua в Corona даёт байтовые методы (toByteArray/pushString(byte[])),
             // они и работают по длине, а не до первого нулевого байта.
             byte[] body = null;
+            boolean nuzhenProgress = false;
             Map<String, String> headers = new HashMap<>();
             int listenerIdx = 0;
             int tableIdx = 0;
@@ -286,6 +287,16 @@ public class LuaLoaderInternal implements JavaFunction {
                 L.getField(tableIdx, "timeout");
                 if (L.type(-1) == LuaType.NUMBER) {
                     timeoutSec = L.toNumber(-1);
+                }
+                L.pop(1);
+
+                // Просят ли события хода передачи. Отдельный флаг, а не всегда:
+                // события идут в очередь Lua-потока, и сыпать ими на каждый
+                // запрос игры незачем — их ждёт только выгрузка и скачивание
+                // файлов.
+                L.getField(tableIdx, "progress");
+                if (L.type(-1) == LuaType.BOOLEAN) {
+                    nuzhenProgress = L.toBoolean(-1);
                 }
                 L.pop(1);
 
@@ -362,6 +373,7 @@ public class LuaLoaderInternal implements JavaFunction {
             final byte[] finalBody = body;
             final Map<String, String> finalHeaders = headers;
             final double finalTimeout = timeoutSec;
+            final boolean finalProgress = nuzhenProgress;
 
             sExecutor.execute(new Runnable() {
                 @Override
@@ -372,7 +384,7 @@ public class LuaLoaderInternal implements JavaFunction {
                             triggerFallback(dispatcher, listenerRef);
                             return;
                         }
-                        startCronetRequest(requestId, url, finalMethod, finalHeaders, finalBody, finalTimeout, dispatcher, listenerRef);
+                        startCronetRequest(requestId, url, finalMethod, finalHeaders, finalBody, finalTimeout, dispatcher, listenerRef, finalProgress);
                     } catch (Exception e) {
                         Log.e(TAG, "Ошибка при запуске запроса Cronet: " + e.getMessage());
                         sActiveRequestsMap.remove(requestId);
@@ -489,7 +501,8 @@ public class LuaLoaderInternal implements JavaFunction {
                                            final byte[] body,
                                            final double timeoutSec,
                                            final CoronaRuntimeTaskDispatcher dispatcher,
-                                           final int listenerRef) {
+                                           final int listenerRef,
+                                           final boolean nuzhenProgress) {
 
         final ByteArrayOutputStream responseStream = new ByteArrayOutputStream();
         final WritableByteChannel responseChannel = Channels.newChannel(responseStream);
@@ -499,6 +512,13 @@ public class LuaLoaderInternal implements JavaFunction {
         // можно только своей пометкой.
         final AtomicBoolean poTaymautu = new AtomicBoolean(false);
         final AtomicBoolean otmenenVyzyvayushchim = new AtomicBoolean(false);
+        // Счётчики прогресса. Массивы, а не поля: их меняют коллбэки Cronet,
+        // объявленные тут же анонимным классом, а тот видит только final.
+        // Гонки нет — Cronet зовёт коллбэки одного запроса последовательно, на
+        // своём исполнителе.
+        final long[] prinyatoVsego = { 0 };
+        final long[] ozhidaetsyaVsego = { -1 };
+        final long[] posledneeSobytie = { 0 };
 
         UrlRequest.Callback callback = new UrlRequest.Callback() {
             @Override
@@ -508,16 +528,35 @@ public class LuaLoaderInternal implements JavaFunction {
 
             @Override
             public void onResponseStarted(UrlRequest request, UrlResponseInfo info) {
+                if (nuzhenProgress) {
+                    ozhidaetsyaVsego[0] = ozhidaemayaDlina(info);
+                    otpravitProgress(dispatcher, listenerRef, requestId, "began",
+                                     0, ozhidaetsyaVsego[0]);
+                }
                 request.read(ByteBuffer.allocateDirect(32768));
             }
 
             @Override
             public void onReadCompleted(UrlRequest request, UrlResponseInfo info, ByteBuffer byteBuffer) {
                 byteBuffer.flip();
+                final int skolko = byteBuffer.remaining();
                 try {
                     responseChannel.write(byteBuffer);
                 } catch (Exception e) {
                     Log.e(TAG, "Ошибка записи тела ответа: " + e.getMessage());
+                }
+                if (nuzhenProgress) {
+                    prinyatoVsego[0] += skolko;
+                    // ТРОТТЛИНГ. Порции приходят по 32 КБ, но на быстрой сети
+                    // это десятки событий в секунду, и каждое — задача в
+                    // очередь Lua-потока. Шлём не чаще чем раз в 100 мс, а
+                    // последнее значение всё равно доедет с фазой "ended".
+                    long teper = android.os.SystemClock.uptimeMillis();
+                    if (teper - posledneeSobytie[0] >= 100) {
+                        posledneeSobytie[0] = teper;
+                        otpravitProgress(dispatcher, listenerRef, requestId, "progress",
+                                         prinyatoVsego[0], ozhidaetsyaVsego[0]);
+                    }
                 }
                 byteBuffer.clear();
                 request.read(byteBuffer);
@@ -534,6 +573,10 @@ public class LuaLoaderInternal implements JavaFunction {
                 // UTF-8, заменив невалидные байты на U+FFFD.
                 final byte[] responseBytes = responseStream.toByteArray();
                 final int bytesTotal = responseStream.size();
+                // Что сервер обещал в Content-Length. Если не обещал — -1, и
+                // вызывающий это отличит (см. otpravitProgress).
+                final long ozhidaetsyaItog = ozhidaetsyaVsego[0] >= 0
+                        ? ozhidaetsyaVsego[0] : bytesTotal;
                 // isError - ТОЛЬКО про сбой транспорта, как у network.request в
                 // Solar2D и как в версии для Windows. Код 4xx/5xx это нормально
                 // доставленный ответ: он приезжает в status, а разбирает его
@@ -576,6 +619,18 @@ public class LuaLoaderInternal implements JavaFunction {
 
                         L.pushInteger(bytesTotal);
                         L.setField(-2, "bytesTotal");
+
+                        // Те же поля, что у network.request: по ним вызывающий
+                        // отличает завершение от промежуточных событий и
+                        // рисует последний кадр индикатора.
+                        L.pushString("ended");
+                        L.setField(-2, "phase");
+
+                        L.pushNumber(bytesTotal);
+                        L.setField(-2, "bytesTransferred");
+
+                        L.pushNumber(ozhidaetsyaItog);
+                        L.setField(-2, "bytesEstimated");
 
                         L.pushString("Cronet");
                         L.setField(-2, "transport");
@@ -666,8 +721,14 @@ public class LuaLoaderInternal implements JavaFunction {
         if (body != null && body.length > 0) {
             // Байты уходят как есть, без getBytes(): перекодировка в UTF-8
             // испортила бы двоичное тело.
+            //
+            // Когда просят прогресс — своё тело со счётом отданного:
+            // UploadDataProviders.create(byte[]) отдаёт всё одним куском и о
+            // ходе передачи сообщить не может.
             requestBuilder.setUploadDataProvider(
-                org.chromium.net.UploadDataProviders.create(body),
+                nuzhenProgress
+                    ? new TeloSoSchyotom(body, dispatcher, listenerRef, requestId, true)
+                    : org.chromium.net.UploadDataProviders.create(body),
                 sExecutor
             );
         }
@@ -685,6 +746,127 @@ public class LuaLoaderInternal implements JavaFunction {
         }, timeoutMillis, TimeUnit.MILLISECONDS);
 
         request.start();
+    }
+
+    /**
+     * Одно событие прогресса в Lua. Поля те же, что у network.request Solar2D:
+     * phase ("began" / "progress"), bytesTransferred, bytesEstimated. Ссылку на
+     * слушателя НЕ отпускаем — запрос ещё идёт, событий будет много, и
+     * освободит её завершение (onSucceeded / onFailed / onCanceled).
+     *
+     * bytesEstimated = -1 означает «сервер не сказал, сколько всего» — ровно
+     * так же ведёт себя Solar2D, когда в ответе нет Content-Length. Полосу в
+     * этом случае рисовать не по чему, и вызывающий должен показывать
+     * неопределённое ожидание, а не ноль процентов.
+     */
+    private static void otpravitProgress(final CoronaRuntimeTaskDispatcher dispatcher,
+                                         final int listenerRef,
+                                         final int requestId,
+                                         final String faza,
+                                         final long peredano,
+                                         final long ozhidaetsya) {
+        if (dispatcher == null || listenerRef == CoronaLua.REFNIL) return;
+        dispatcher.send(new CoronaRuntimeTask() {
+            @Override
+            public void executeUsing(CoronaRuntime runtime) {
+                LuaState L = runtime.getLuaState();
+                CoronaLua.newEvent(L, "http3");
+
+                L.pushInteger(requestId);
+                L.setField(-2, "requestId");
+
+                L.pushString(faza);
+                L.setField(-2, "phase");
+
+                L.pushBoolean(false);
+                L.setField(-2, "isError");
+
+                L.pushNumber(peredano);
+                L.setField(-2, "bytesTransferred");
+
+                L.pushNumber(ozhidaetsya);
+                L.setField(-2, "bytesEstimated");
+
+                L.pushBoolean(true);
+                L.setField(-2, "isNative");
+
+                try {
+                    CoronaLua.dispatchEvent(L, listenerRef, 0);
+                } catch (Exception e) {
+                    Log.e(TAG, "Ошибка события прогресса: " + e.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
+     * Ожидаемая длина тела из заголовков ответа, или -1.
+     */
+    private static long ozhidaemayaDlina(UrlResponseInfo info) {
+        if (info == null) return -1;
+        Map<String, List<String>> zag = info.getAllHeaders();
+        if (zag == null) return -1;
+        for (Map.Entry<String, List<String>> e : zag.entrySet()) {
+            if (e.getKey() != null && e.getKey().equalsIgnoreCase("Content-Length")
+                    && e.getValue() != null && !e.getValue().isEmpty()) {
+                try {
+                    return Long.parseLong(e.getValue().get(0).trim());
+                } catch (NumberFormatException ignored) {
+                    return -1;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Тело запроса порциями, со счётом отданного. Нужен ради прогресса
+     * ОТПРАВКИ: UploadDataProviders.create(byte[]) отдаёт всё одним куском и
+     * сообщить о ходе передачи не может.
+     *
+     * Размер порции — тот же, что у приёма (32 КБ): меньше даёт лишние
+     * пробуждения исполнителя, больше — слишком редкие события на мелких
+     * телах, а голосовое сообщение это как раз 8-20 КБ.
+     */
+    private static final class TeloSoSchyotom extends org.chromium.net.UploadDataProvider {
+        private final byte[] telo;
+        private int otdano;
+        private final CoronaRuntimeTaskDispatcher dispatcher;
+        private final int listenerRef;
+        private final int requestId;
+        private final boolean nuzhenProgress;
+
+        TeloSoSchyotom(byte[] telo, CoronaRuntimeTaskDispatcher dispatcher,
+                       int listenerRef, int requestId, boolean nuzhenProgress) {
+            this.telo = telo;
+            this.dispatcher = dispatcher;
+            this.listenerRef = listenerRef;
+            this.requestId = requestId;
+            this.nuzhenProgress = nuzhenProgress;
+        }
+
+        @Override
+        public long getLength() { return telo.length; }
+
+        @Override
+        public void read(org.chromium.net.UploadDataSink sink, java.nio.ByteBuffer buffer) {
+            int skolko = Math.min(buffer.remaining(), telo.length - otdano);
+            buffer.put(telo, otdano, skolko);
+            otdano += skolko;
+            if (nuzhenProgress) {
+                otpravitProgress(dispatcher, listenerRef, requestId, "progress",
+                                 otdano, telo.length);
+            }
+            sink.onReadSucceeded(false);
+        }
+
+        @Override
+        public void rewind(org.chromium.net.UploadDataSink sink) {
+            // Перенаправление или повтор: счёт начинаем заново, иначе прогресс
+            // «поедет» за пределы длины тела.
+            otdano = 0;
+            sink.onRewindSucceeded();
+        }
     }
 
     /**
