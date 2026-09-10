@@ -114,11 +114,31 @@ foreach ($p in $Platformy) {
             Write-Host "[$p] обёртка обновлена из lua\plugin_http3.lua"
         }
 
-        # Собираем ВСЁ, что лежит рядом, кроме самого архива. Пути внутри
+        # Собираем то, что лежит рядом, кроме самого архива. Пути внутри
         # архива должны быть плоскими — Solar2D распаковывает его как есть.
-        $Fayly = Get-ChildItem -Path $Papka -File |
-            Where-Object { $_.Name -ne "data.tgz" } |
-            ForEach-Object { $_.Name }
+        #
+        # ТОЛЬКО ОТСЛЕЖИВАЕМОЕ GIT. Прежде паковалось всё подряд, и в win32-архив
+        # уехал msquic.dll, лежавший рядом от сборки стенда: в репозитории его
+        # нет, у другого человека архив собрался бы иным, а опубликованный
+        # отличался бы от исходников молча. Не репозиторий или git не ответил —
+        # откатываемся на прежнее поведение и ГОВОРИМ об этом.
+        $Fayly = $null
+        try {
+            $Spisok = & git -C $Papka ls-files 2>$null
+            if ($LASTEXITCODE -eq 0 -and $Spisok) {
+                # Имена приходят относительно $Papka; вложенные каталоги
+                # (с "/") архиву не нужны — он плоский.
+                $Fayly = @($Spisok | Where-Object {
+                    $_ -and ($_ -notmatch "/") -and ($_ -ne "data.tgz")
+                })
+            }
+        } catch { }
+        if ($null -eq $Fayly) {
+            Write-Host "[$p] git не ответил — пакую всё, что лежит рядом" -ForegroundColor Yellow
+            $Fayly = @(Get-ChildItem -Path $Papka -File |
+                Where-Object { $_.Name -ne "data.tgz" } |
+                ForEach-Object { $_.Name })
+        }
         if ($Fayly.Count -eq 0) {
             Write-Host "[$p] рядом с архивом нет файлов — пропуск" -ForegroundColor Yellow
             continue

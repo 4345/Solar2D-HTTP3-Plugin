@@ -24,9 +24,12 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -53,6 +56,30 @@ import java.util.concurrent.atomic.AtomicLong;
 public class LuaLoaderInternal implements JavaFunction {
 
     private static final String TAG = "HTTP3_Cronet";
+
+    // Не чаще этого шлём события хода передачи. Порции приходят по 32 КБ, и на
+    // быстрой сети их десятки в секунду; каждое событие — задача в очередь
+    // Lua-потока, а перерисовывать индикатор чаще двух раз в секунду глазу
+    // всё равно нечего. Последнее значение доезжает с фазой "ended", так что
+    // на точности итога порог не сказывается.
+    private static final long PROGRESS_PAUZA_MS = 500;
+
+    // Хосты, которым при создании движка выдаётся подсказка про HTTP/3.
+    //
+    // ЗАЧЕМ. Про поддержку h3 Cronet узнаёт из заголовка Alt-Svc, то есть УЖЕ
+    // получив ответ — а первый ответ приходит по TCP. Дальше знание живёт в
+    // дисковом кэше, и следующие запросы идут по QUIC: ровно это и выглядит
+    // как «первый раз TCP, второй раз UDP». addQuicHint снимает первый заход:
+    // движок пробует QUIC сразу, не дожидаясь Alt-Svc.
+    //
+    // Список НЕ зашит: плагин общий, чужих адресов он знать не должен. Хосты
+    // копятся сами — каждый, к которому обращались, запоминается до следующего
+    // запуска. Хост первого запроса попадает в подсказки сразу, ещё до сборки
+    // движка, поэтому на свежей установке по QUIC идёт уже он.
+    private static final String NASTROYKI_PODSKAZOK = "http3_podskazki";
+    private static final String KLYUCH_HOSTY = "hosty";
+    private static final Set<String> sHostyPodskazki =
+            Collections.synchronizedSet(new HashSet<String>());
 
     // --- Состояние CronetEngine (инициализируется лениво, один раз на процесс) ---
     private static boolean sCronetInitialized = false;
@@ -119,9 +146,57 @@ public class LuaLoaderInternal implements JavaFunction {
     // ===========================================================================
 
     /**
-     * Попытка инициализировать CronetEngine (синхронно, на вызывающем потоке).
+     * Достаёт имя хоста из URL. Своим разбором, а не java.net.URI: тот бросает
+     * исключение на пробелах и прочих вольностях, которые сеть переживает.
      */
-    private static synchronized boolean initializeCronet(Context context) {
+    private static String hostIzUrl(String url) {
+        if (url == null) return null;
+        int nachalo = url.indexOf("://");
+        nachalo = (nachalo < 0) ? 0 : nachalo + 3;
+        int konec = url.length();
+        for (int i = nachalo; i < url.length(); i++) {
+            char c = url.charAt(i);
+            if (c == '/' || c == '?' || c == '#' || c == ':') { konec = i; break; }
+        }
+        // Логин и пароль в URL (user@host) отбрасываем.
+        String host = url.substring(nachalo, konec);
+        int sobaka = host.indexOf('@');
+        if (sobaka >= 0) host = host.substring(sobaka + 1);
+        return host.isEmpty() ? null : host;
+    }
+
+    /**
+     * Запоминает хост для подсказки. Возвращает true, если он новый.
+     *
+     * Пишем на диск ТОЛЬКО когда список изменился: обращение идёт на каждый
+     * запрос, а SharedPreferences — это файл.
+     */
+    private static boolean zapomnitHost(Context context, String url) {
+        String host = hostIzUrl(url);
+        if (host == null || !sHostyPodskazki.add(host)) {
+            return false;
+        }
+        if (context == null) return true;
+        try {
+            Set<String> kopiya;
+            synchronized (sHostyPodskazki) {
+                kopiya = new HashSet<String>(sHostyPodskazki);
+            }
+            context.getSharedPreferences(NASTROYKI_PODSKAZOK, Context.MODE_PRIVATE)
+                   .edit().putStringSet(KLYUCH_HOSTY, kopiya).apply();
+        } catch (Throwable t) {
+            // Не смогли сохранить — подсказка просто не переживёт перезапуск.
+            Log.w(TAG, "Не удалось сохранить список хостов: " + t.getMessage());
+        }
+        return true;
+    }
+
+    /**
+     * Попытка инициализировать CronetEngine (синхронно, на вызывающем потоке).
+     * url — адрес запроса, который эту инициализацию и вызвал: его хост обязан
+     * попасть в подсказки ДО сборки движка, иначе первый же запрос уйдёт по TCP.
+     */
+    private static synchronized boolean initializeCronet(Context context, String url) {
         if (sCronetInitialized) {
             return true;
         }
@@ -166,6 +241,26 @@ public class LuaLoaderInternal implements JavaFunction {
             builder.enableQuic(true);
             builder.enableHttp2(true);
             builder.enableBrotli(true);
+
+            // Подсказки про HTTP/3 — см. коммент у sHostyPodskazki. Читаем
+            // список прошлого запуска и добавляем хост текущего запроса.
+            try {
+                Set<String> sohranyonnye = context
+                        .getSharedPreferences(NASTROYKI_PODSKAZOK, Context.MODE_PRIVATE)
+                        .getStringSet(KLYUCH_HOSTY, null);
+                if (sohranyonnye != null) sHostyPodskazki.addAll(sohranyonnye);
+            } catch (Throwable t) {
+                Log.w(TAG, "Не удалось прочитать список хостов: " + t.getMessage());
+            }
+            zapomnitHost(context, url);
+            synchronized (sHostyPodskazki) {
+                for (String h : sHostyPodskazki) {
+                    // 443 и там, и там: порт h3 у наших серверов тот же, что у
+                    // TLS. Иное объявил бы Alt-Svc, и Cronet возьмёт его сам.
+                    builder.addQuicHint(h, 443, 443);
+                }
+                Log.i(TAG, "Подсказки HTTP/3 выданы хостам: " + sHostyPodskazki.size());
+            }
 
             // Настраиваем дисковый кэш исключительно для сохранения Alt-Svc, сертификатов и сессионных токенов QUIC.
             // Использование HTTP_CACHE_DISK_NO_HTTP гарантирует, что сам HTTP-контент ответов НЕ кэшируется на диске,
@@ -397,11 +492,15 @@ public class LuaLoaderInternal implements JavaFunction {
                 @Override
                 public void run() {
                     try {
-                        if (!initializeCronet(context)) {
+                        if (!initializeCronet(context, url)) {
                             sTotalFailed.incrementAndGet();
                             triggerFallback(dispatcher, listenerRef);
                             return;
                         }
+                        // Хост уже работающего движка подсказкой не снабдить —
+                        // движок собран. Но запомнить его надо: подсказка
+                        // достанется следующему запуску.
+                        zapomnitHost(context, url);
                         startCronetRequest(requestId, url, finalMethod, finalHeaders, finalBody, finalTimeout, dispatcher, listenerRef, finalProgressOtpravki, finalProgressPriyoma);
                     } catch (Exception e) {
                         Log.e(TAG, "Ошибка при запуске запроса Cronet: " + e.getMessage());
@@ -566,12 +665,9 @@ public class LuaLoaderInternal implements JavaFunction {
                 }
                 if (progressPriyoma) {
                     prinyatoVsego[0] += skolko;
-                    // ТРОТТЛИНГ. Порции приходят по 32 КБ, но на быстрой сети
-                    // это десятки событий в секунду, и каждое — задача в
-                    // очередь Lua-потока. Шлём не чаще чем раз в 100 мс, а
-                    // последнее значение всё равно доедет с фазой "ended".
+                    // Порог общий с отправкой — см. PROGRESS_PAUZA_MS.
                     long teper = android.os.SystemClock.uptimeMillis();
-                    if (teper - posledneeSobytie[0] >= 100) {
+                    if (teper - posledneeSobytie[0] >= PROGRESS_PAUZA_MS) {
                         posledneeSobytie[0] = teper;
                         otpravitProgress(dispatcher, listenerRef, requestId, "progress",
                                          prinyatoVsego[0], ozhidaetsyaVsego[0]);
@@ -854,6 +950,7 @@ public class LuaLoaderInternal implements JavaFunction {
         private final int listenerRef;
         private final int requestId;
         private boolean nachaloOtpravleno;
+        private long posledneeSobytie;
 
         TeloSoSchyotom(byte[] telo, CoronaRuntimeTaskDispatcher dispatcher,
                        int listenerRef, int requestId) {
@@ -879,8 +976,15 @@ public class LuaLoaderInternal implements JavaFunction {
             int skolko = Math.min(buffer.remaining(), telo.length - otdano);
             buffer.put(telo, otdano, skolko);
             otdano += skolko;
-            otpravitProgress(dispatcher, listenerRef, requestId, "progress",
-                             otdano, telo.length);
+            // Порог тот же, что у приёма: без него событие уходило на КАЖДУЮ
+            // порцию — на быстрой сети это десятки в секунду, и индикатор
+            // дёргался чаще, чем глазу нужно. Итог доезжает с фазой "ended".
+            long teper = android.os.SystemClock.uptimeMillis();
+            if (teper - posledneeSobytie >= PROGRESS_PAUZA_MS) {
+                posledneeSobytie = teper;
+                otpravitProgress(dispatcher, listenerRef, requestId, "progress",
+                                 otdano, telo.length);
+            }
             sink.onReadSucceeded(false);
         }
 
@@ -891,6 +995,7 @@ public class LuaLoaderInternal implements JavaFunction {
             // вызывающего это новая передача того же тела.
             otdano = 0;
             nachaloOtpravleno = false;
+            posledneeSobytie = 0;
             sink.onRewindSucceeded();
         }
     }
