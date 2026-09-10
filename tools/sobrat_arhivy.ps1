@@ -64,7 +64,10 @@ foreach ($p in $Platformy) {
         }
         Push-Location $Papka
         try {
-            & tar -czf "data.tgz" @Fayly
+            # Массив передаём КАК ЕСТЬ: @ перед именем — это splatting для
+            # командлетов, а внешний tar от него получал мусор из окружения
+            # («Couldn't visit directory: am Files\Intel\WiFi…»).
+            & tar -czf "data.tgz" $Fayly
             if ($LASTEXITCODE -ne 0) { throw "tar вернул $LASTEXITCODE" }
         } finally { Pop-Location }
     }

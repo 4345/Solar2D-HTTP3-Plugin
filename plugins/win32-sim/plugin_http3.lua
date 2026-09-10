@@ -45,8 +45,17 @@ local function loadNativeLibrary()
     --     они будут пересобраны с alias luaopen_plugin_http3_ntv (он уже
     --     добавлен в shared/SimulatorPluginLibrary.cpp и .mm), эту строку
     --     можно убрать.
-    --   plugin.http3        — базовое имя, как отдаёт Apple-сборка.
-    local imena = { "plugin.http3.ntv", "plugin.http3.native", "plugin.http3" }
+    --
+    -- САМОГО «plugin.http3» в списке НЕТ. Под этим именем живёт ЭТА обёртка:
+    -- на Android она обязана лежать файлом приложения (lua/plugin/http3.lua),
+    -- потому что Lua-часть плагина из data.tgz в APK не попадает вовсе — так
+    -- устроена сборка Solar2D, и официальные Android-плагины Lua-файлов в
+    -- архивах не держат. А раз имя занято обёрткой, require по нему из этой же
+    -- функции загружал бы файл повторно: loadNativeLibrary зовётся ещё на
+    -- этапе загрузки модуля, когда package.loaded['plugin.http3'] пуст, и
+    -- рекурсия упиралась бы в переполнение стека (её гасил pcall, но ценой
+    -- многократного выполнения файла).
+    local imena = { "plugin.http3.ntv", "plugin.http3.native" }
 
     -- Вариант 1: Зарегистрированный предзагрузчик в package.preload
     if package and package.preload then
