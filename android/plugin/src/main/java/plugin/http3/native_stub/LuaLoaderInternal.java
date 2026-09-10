@@ -64,6 +64,28 @@ public class LuaLoaderInternal implements JavaFunction {
     // на точности итога порог не сказывается.
     private static final long PROGRESS_PAUZA_MS = 500;
 
+    // Чьим резолвером разрешать имена.
+    //
+    // true  - встроенный резолвер Chromium (экспериментальная опция AsyncDNS).
+    //         Разрешение идёт одним путём для всех запросов плагина, и только
+    //         на нём Cronet способен поднять защищённый DNS (DoH/DoH3) - через
+    //         системный резолвер он этого не умеет в принципе.
+    // false - системный резолвер Android, как было раньше.
+    //
+    // ЧЕМ РИСКУЕМ. Сломанное разрешение имён кладёт игру целиком, поэтому
+    // важно: при отказе Cronet зовёт onFailed, а тот уводит запрос в
+    // triggerFallback - Lua-обёртка повторяет его через network.request, то
+    // есть системным резолвером и по TCP. Медленнее, но связь остаётся.
+    //
+    // ЧЕГО НЕ ОБЕЩАЕТ. Сам по себе AsyncDNS не включает шифрование DNS: он
+    // включает резолвер, который на это способен. Пойдёт ли трафик DoH3,
+    // зависит от того, поднимет ли Cronet защищённый апстрим для резолвера,
+    // назначенного сетью. Видно это только в перехвате.
+    //
+    // Выключается сменой на false и пересборкой (tools/sobrat_arhivy.ps1
+    // соберёт AAR сам).
+    private static final boolean VSTROENNYY_DNS = true;
+
     // Хосты, которым при создании движка выдаётся подсказка про HTTP/3.
     //
     // ЗАЧЕМ. Про поддержку h3 Cronet узнаёт из заголовка Alt-Svc, то есть УЖЕ
@@ -283,7 +305,13 @@ public class LuaLoaderInternal implements JavaFunction {
             //    При блокировке UDP Cronet временно отключает HTTP/3 на 10 секунд, а после восстановления пропуска UDP
             //    по истечении 10 секунд новые сессии автоматически возвращаются на транспорт HTTP/3.
             // 4. connection_id_length: длина идентификатора соединения QUIC (Connection ID) 4 байта.
-            String experimentalOptions = "{\"QUIC\":{\"race_cert_verification\":true,\"delay_tcp_race\":true,\"initial_delay_for_broken_alternative_service_seconds\":10,\"connection_id_length\":4}}";
+            // 5. AsyncDNS: встроенный резолвер Chromium вместо системного —
+            //    см. VSTROENNYY_DNS. Блок собирается отдельно, чтобы его можно
+            //    было убрать одним переключателем, не трогая настройки QUIC.
+            String quicOptions = "\"QUIC\":{\"race_cert_verification\":true,\"delay_tcp_race\":true,\"initial_delay_for_broken_alternative_service_seconds\":10,\"connection_id_length\":4}";
+            String dnsOptions = VSTROENNYY_DNS ? ",\"AsyncDNS\":{\"enable\":true}" : "";
+            String experimentalOptions = "{" + quicOptions + dnsOptions + "}";
+            Log.i(TAG, "Резолвер: " + (VSTROENNYY_DNS ? "встроенный (AsyncDNS)" : "системный"));
             try {
                 if (builder instanceof org.chromium.net.ExperimentalCronetEngine.Builder) {
                     ((org.chromium.net.ExperimentalCronetEngine.Builder) builder).setExperimentalOptions(experimentalOptions);
