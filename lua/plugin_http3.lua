@@ -211,6 +211,13 @@ function M.request(url, method, listener, params)
         else
             if event then
                 event.name = event.name or "http3"
+                -- ФАЗА ЕСТЬ ВСЕГДА. Промежуточные события её несут (began /
+                -- progress), а завершение приходит без неё от слоёв, которые
+                -- шлют только готовый результат (опрос в Windows). Вызывающий
+                -- же разбирает ответ по phase == "ended" — ровно так написан
+                -- код в играх на network.request, — и без этой строки
+                -- завершение у него просто не наступало бы.
+                if event.phase == nil then event.phase = "ended" end
                 event.transport = event.transport or (nativeLib and "Native HTTP/3" or "Solar2D network.request (Fallback)")
                 event.protocol = event.protocol or (nativeLib and "HTTP/3 (QUIC / h3)" or "HTTP/2.0 (Fallback)")
                 event.isNative = (nativeLib ~= nil)

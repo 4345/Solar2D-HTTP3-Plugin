@@ -14,12 +14,19 @@
 # архив устроен иначе (внутри вложенный data.tgz и metadata.lua) и делается
 # своим скриптом — Apple\deployLocal.sh.
 #
+# Android вдобавок несёт нативную библиотеку plugin-release.aar. Она собирается
+# из Java (android\plugin\src) через Gradle, и её тоже надо обновлять: правка в
+# Java, не дошедшая до архива, просто не попадёт на устройство. Скрипт сам
+# запускает сборку, если исходники новее архива.
+#
 # Запуск (из корня репозитория плагина):
 #   powershell -ExecutionPolicy Bypass -File tools\sobrat_arhivy.ps1
 #   ... -Proverit        # только проверить состав, ничего не пересобирая
+#   ... -BezGradle       # не трогать AAR, взять какой лежит
 
 param(
-    [switch]$Proverit
+    [switch]$Proverit,
+    [switch]$BezGradle
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +42,60 @@ if (-not (Test-Path $Obertka)) {
 }
 
 $Oshibok = 0
+
+# --- Нативная библиотека Android -------------------------------------------
+# Собирает AAR, если Java новее того, что лежит в plugins\android, и кладёт
+# свежий рядом с архивом. Не находим JDK или Gradle падает — ГРОМКО пишем и
+# идём дальше: у стороннего человека с публичным репозиторием может не быть
+# Android-окружения вовсе, и Lua-часть собрать он всё равно должен.
+function Obnovit-Aar {
+    $Ishodniki = Join-Path $Koren "android\plugin\src"
+    $Gotovyy = Join-Path $Koren "plugins\android\plugin-release.aar"
+    if (-not (Test-Path $Ishodniki)) { return }
+
+    $Svezhest = (Get-ChildItem $Ishodniki -Recurse -File |
+        Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+    if ((Test-Path $Gotovyy) -and
+        $Svezhest -le (Get-Item $Gotovyy).LastWriteTimeUtc) {
+        Write-Host "[android] AAR свежий, Gradle не нужен"
+        return
+    }
+
+    # JAVA_HOME у Android Studio лежит в jbr; своего JDK в системе может не
+    # быть вовсе, и без подсказки Gradle не стартует.
+    if (-not $env:JAVA_HOME) {
+        foreach ($k in @("C:\Program Files\Android\Android Studio\jbr",
+                         "C:\Program Files\Android\Android Studio\jre")) {
+            if (Test-Path $k) { $env:JAVA_HOME = $k; break }
+        }
+    }
+    if (-not $env:JAVA_HOME) {
+        Write-Host "[android] JDK не найден — AAR остаётся прежним, правки в Java НЕ доедут" -ForegroundColor Red
+        $script:Oshibok++
+        return
+    }
+
+    Push-Location (Join-Path $Koren "android")
+    try {
+        & .\gradlew.bat :plugin:assembleRelease --console=plain -q
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[android] Gradle вернул $LASTEXITCODE — AAR остаётся прежним" -ForegroundColor Red
+            $script:Oshibok++
+            return
+        }
+    } finally { Pop-Location }
+
+    $Sobrannyy = Join-Path $Koren "android\plugin\build\outputs\aar\plugin-release.aar"
+    if (-not (Test-Path $Sobrannyy)) {
+        Write-Host "[android] Gradle отработал, но AAR не найден: $Sobrannyy" -ForegroundColor Red
+        $script:Oshibok++
+        return
+    }
+    Copy-Item $Sobrannyy $Gotovyy -Force
+    Write-Host "[android] AAR пересобран из Java"
+}
+
+if (-not $Proverit -and -not $BezGradle) { Obnovit-Aar }
 
 foreach ($p in $Platformy) {
     $Papka = Join-Path $Koren "plugins\$p"

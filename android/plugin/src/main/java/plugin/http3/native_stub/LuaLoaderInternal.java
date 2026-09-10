@@ -249,7 +249,11 @@ public class LuaLoaderInternal implements JavaFunction {
             // JNLua в Corona даёт байтовые методы (toByteArray/pushString(byte[])),
             // они и работают по длине, а не до первого нулевого байта.
             byte[] body = null;
-            boolean nuzhenProgress = false;
+            // Направления считаем порознь: Solar2D различает "upload" и
+            // "download", и слать оба, когда просили одно, значит путать
+            // вызывающего чужими байтами.
+            boolean progressOtpravki = false;
+            boolean progressPriyoma = false;
             Map<String, String> headers = new HashMap<>();
             int listenerIdx = 0;
             int tableIdx = 0;
@@ -294,9 +298,22 @@ public class LuaLoaderInternal implements JavaFunction {
                 // события идут в очередь Lua-потока, и сыпать ими на каждый
                 // запрос игры незачем — их ждёт только выгрузка и скачивание
                 // файлов.
+                //
+                // ЗНАЧЕНИЕ БЫВАЕТ И СТРОКОЙ. В Solar2D params.progress
+                // принимает "upload" либо "download" — именно так его задаёт
+                // выгрузка файла (params.progress = "upload").
+                // Пока тут стояла проверка только на BOOLEAN, строка молча
+                // отбрасывалась и выгрузка не получала ни одного события.
+                // true оставляем как «оба направления»: так его понимает
+                // скачивание файла (params.progress = true).
                 L.getField(tableIdx, "progress");
                 if (L.type(-1) == LuaType.BOOLEAN) {
-                    nuzhenProgress = L.toBoolean(-1);
+                    progressOtpravki = L.toBoolean(-1);
+                    progressPriyoma = progressOtpravki;
+                } else if (L.type(-1) == LuaType.STRING) {
+                    String napravlenie = L.toString(-1);
+                    progressOtpravki = "upload".equalsIgnoreCase(napravlenie);
+                    progressPriyoma = "download".equalsIgnoreCase(napravlenie);
                 }
                 L.pop(1);
 
@@ -373,7 +390,8 @@ public class LuaLoaderInternal implements JavaFunction {
             final byte[] finalBody = body;
             final Map<String, String> finalHeaders = headers;
             final double finalTimeout = timeoutSec;
-            final boolean finalProgress = nuzhenProgress;
+            final boolean finalProgressOtpravki = progressOtpravki;
+            final boolean finalProgressPriyoma = progressPriyoma;
 
             sExecutor.execute(new Runnable() {
                 @Override
@@ -384,7 +402,7 @@ public class LuaLoaderInternal implements JavaFunction {
                             triggerFallback(dispatcher, listenerRef);
                             return;
                         }
-                        startCronetRequest(requestId, url, finalMethod, finalHeaders, finalBody, finalTimeout, dispatcher, listenerRef, finalProgress);
+                        startCronetRequest(requestId, url, finalMethod, finalHeaders, finalBody, finalTimeout, dispatcher, listenerRef, finalProgressOtpravki, finalProgressPriyoma);
                     } catch (Exception e) {
                         Log.e(TAG, "Ошибка при запуске запроса Cronet: " + e.getMessage());
                         sActiveRequestsMap.remove(requestId);
@@ -502,7 +520,8 @@ public class LuaLoaderInternal implements JavaFunction {
                                            final double timeoutSec,
                                            final CoronaRuntimeTaskDispatcher dispatcher,
                                            final int listenerRef,
-                                           final boolean nuzhenProgress) {
+                                           final boolean progressOtpravki,
+                                           final boolean progressPriyoma) {
 
         final ByteArrayOutputStream responseStream = new ByteArrayOutputStream();
         final WritableByteChannel responseChannel = Channels.newChannel(responseStream);
@@ -528,7 +547,7 @@ public class LuaLoaderInternal implements JavaFunction {
 
             @Override
             public void onResponseStarted(UrlRequest request, UrlResponseInfo info) {
-                if (nuzhenProgress) {
+                if (progressPriyoma) {
                     ozhidaetsyaVsego[0] = ozhidaemayaDlina(info);
                     otpravitProgress(dispatcher, listenerRef, requestId, "began",
                                      0, ozhidaetsyaVsego[0]);
@@ -545,7 +564,7 @@ public class LuaLoaderInternal implements JavaFunction {
                 } catch (Exception e) {
                     Log.e(TAG, "Ошибка записи тела ответа: " + e.getMessage());
                 }
-                if (nuzhenProgress) {
+                if (progressPriyoma) {
                     prinyatoVsego[0] += skolko;
                     // ТРОТТЛИНГ. Порции приходят по 32 КБ, но на быстрой сети
                     // это десятки событий в секунду, и каждое — задача в
@@ -726,8 +745,8 @@ public class LuaLoaderInternal implements JavaFunction {
             // UploadDataProviders.create(byte[]) отдаёт всё одним куском и о
             // ходе передачи сообщить не может.
             requestBuilder.setUploadDataProvider(
-                nuzhenProgress
-                    ? new TeloSoSchyotom(body, dispatcher, listenerRef, requestId, true)
+                progressOtpravki
+                    ? new TeloSoSchyotom(body, dispatcher, listenerRef, requestId)
                     : org.chromium.net.UploadDataProviders.create(body),
                 sExecutor
             );
@@ -834,15 +853,14 @@ public class LuaLoaderInternal implements JavaFunction {
         private final CoronaRuntimeTaskDispatcher dispatcher;
         private final int listenerRef;
         private final int requestId;
-        private final boolean nuzhenProgress;
+        private boolean nachaloOtpravleno;
 
         TeloSoSchyotom(byte[] telo, CoronaRuntimeTaskDispatcher dispatcher,
-                       int listenerRef, int requestId, boolean nuzhenProgress) {
+                       int listenerRef, int requestId) {
             this.telo = telo;
             this.dispatcher = dispatcher;
             this.listenerRef = listenerRef;
             this.requestId = requestId;
-            this.nuzhenProgress = nuzhenProgress;
         }
 
         @Override
@@ -850,21 +868,29 @@ public class LuaLoaderInternal implements JavaFunction {
 
         @Override
         public void read(org.chromium.net.UploadDataSink sink, java.nio.ByteBuffer buffer) {
+            // "began" перед первой порцией: у network.request Solar2D передача
+            // начинается именно этой фазой, и вызывающий по ней ставит
+            // индикатор в ноль, а не додумывает начало по первому "progress".
+            if (!nachaloOtpravleno) {
+                nachaloOtpravleno = true;
+                otpravitProgress(dispatcher, listenerRef, requestId, "began",
+                                 0, telo.length);
+            }
             int skolko = Math.min(buffer.remaining(), telo.length - otdano);
             buffer.put(telo, otdano, skolko);
             otdano += skolko;
-            if (nuzhenProgress) {
-                otpravitProgress(dispatcher, listenerRef, requestId, "progress",
-                                 otdano, telo.length);
-            }
+            otpravitProgress(dispatcher, listenerRef, requestId, "progress",
+                             otdano, telo.length);
             sink.onReadSucceeded(false);
         }
 
         @Override
         public void rewind(org.chromium.net.UploadDataSink sink) {
             // Перенаправление или повтор: счёт начинаем заново, иначе прогресс
-            // «поедет» за пределы длины тела.
+            // «поедет» за пределы длины тела. Начало объявляем повторно — для
+            // вызывающего это новая передача того же тела.
             otdano = 0;
+            nachaloOtpravleno = false;
             sink.onRewindSucceeded();
         }
     }
