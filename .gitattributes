@@ -1,0 +1,25 @@
+# Концы строк задаёт репозиторий, а не настройки машины.
+# Текст хранится с LF, и в рабочей копии он тоже с LF — на macOS
+# и на Windows одинаково, при любом core.autocrlf.
+* text=auto eol=lf
+
+# CRLF — только тем, кому он нужен: cmd.exe при LF путается в метках
+# и goto, а Visual Studio пишет файлы решений и проектов с CRLF.
+*.bat              text eol=crlf
+*.cmd              text eol=crlf
+*.sln              text eol=crlf
+*.vcxproj          text eol=crlf
+*.vcxproj.filters  text eol=crlf
+*.props            text eol=crlf
+*.targets          text eol=crlf
+
+# Двоичные файлы: без преобразований и текстовых диффов.
+*.dll    binary
+*.lib    binary
+*.dylib  binary
+*.so     binary
+*.a      binary
+*.aar    binary
+*.jar    binary
+*.tgz    binary
+*.png    binary
