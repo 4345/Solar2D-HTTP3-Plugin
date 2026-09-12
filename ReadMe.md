@@ -175,15 +175,32 @@ cd android && ./gradlew :plugin:deployToLocalSolar2DRepo
 рядом с ним, поэтому после правки любого файла платформы архив надо пересобрать:
 
 ```
-powershell -ExecutionPolicy Bypass -File tools\sobrat_arhivy.ps1
+python3 tools/sobrat_arhivy.py
 ```
 
 Скрипт собирает `win32`, `win32-sim`, `android` и `lua` из файлов каталога и
 следит за главным: в каждом архиве должна лежать Lua-обёртка `plugin_http3.lua`
 — модуль плагина называется `plugin.http3`, и это именно она (нативная часть
-объявляет `plugin.http3.ntv`, а не `plugin.http3`). Apple-архивы устроены иначе
-и собираются `Apple/deployLocal.sh`, их скрипт только проверяет. Ключ
-`-Proverit` показывает состав всех архивов, ничего не пересобирая.
+объявляет `plugin.http3.ntv`, а не `plugin.http3`). Ключ `--proverit`
+показывает состав всех архивов, ничего не пересобирая, `--bez-gradle` не
+трогает AAR.
+
+Нужен только Python 3.8+. Прежде скрипт был на PowerShell и работал лишь под
+Windows — то есть ровно там, где Apple-часть и не собирается, а значит
+проверить её состав на маке было нечем.
+
+**Apple собирается только на маке.** Нативная часть iOS и macOS — это
+Objective-C++, её собирает clang из Xcode, и под Windows этих платформ не
+собрать вовсе. Поэтому `sobrat_arhivy.py` их не трогает, а только проверяет
+состав. Собирает их на macOS:
+
+```
+Apple/build.sh                 # iphone, iphone-sim, macOS, mac-sim
+Apple/deployLocal.sh           # то же + выкладка в ~/Solar2DPlugins
+```
+
+Правки в `shared/SimulatorPluginLibrary.mm`, сделанные на Windows, в архивы
+Apple НЕ попадают — их надо довезти этим скриптом с мака.
 
 **Чем собирать.** Нужен JDK 17 (проверено) — им же располагает и сама Solar2D:
 `<Solar2D>/Corona/jre`. На JDK 25 сборка падает ещё на конфигурации, с
@@ -353,8 +370,8 @@ Solar2D-HTTP3-Plugin/
 │   ├── win32/                      # Нативный модуль и data.tgz для Windows Desktop
 │   ├── win32-sim/                  # Нативный модуль и data.tgz для Windows Simulator
 │   ├── android/                    # plugin-release.aar и data.tgz для Android
-│   ├── iphone/                     # Модуль и data.tgz для iOS устройств
-│   ├── iphone-sim/                 # Модуль и data.tgz для iOS Симулятора
+│   ├── iphone/                     # libplugin_http3_native.a и data.tgz для iOS устройств
+│   ├── iphone-sim/                 # libplugin_http3_native.a и data.tgz для iOS Симулятора
 │   ├── macOS/                      # plugin_http3.dylib и data.tgz для macOS Desktop
 │   ├── mac-sim/                    # plugin_http3.dylib и data.tgz для macOS Simulator
 │   ├── lua/                        # Резервный Lua-модуль и data.tgz
@@ -373,8 +390,8 @@ Solar2D-HTTP3-Plugin/
 │       ├── ntv/LuaLoader.java      # Загрузчик, который ищет Solar2D по имени модуля
 │       └── native_stub/LuaLoaderInternal.java  # Реализация на Cronet
 ├── tools/
-│   └── sobrat_arhivy.ps1           # Пересборка data.tgz платформ из файлов рядом с ним
-├── Apple/                          # Скрипты сборки Xcode, Makefile и deployLocal.sh
+│   └── sobrat_arhivy.py            # Пересборка data.tgz платформ из файлов рядом с ним
+├── Apple/                          # build.sh (сборка Apple-платформ), deployLocal.sh, Makefile стенда
 ├── test_app/                       # Универсальное тестовое Solar2D-приложение
 │   ├── main.lua                    # Дашборд проверки метрик памяти и пачек из 50 запросов
 │   ├── build.settings              # Пример конфигурации

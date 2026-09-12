@@ -28,39 +28,51 @@
 ## 📁 Структура Проекта 3
 
 ```
-3/
-├── shared/
-│   ├── SimulatorPluginLibrary.h    # Заголовочный файл C++ экспорта плагина
-│   ├── SimulatorPluginLibrary.mm   # Объединённый нативный модуль iOS / macOS (Objective-C++)
-│   ├── SimulatorPluginLibrary.cpp  # Нативный модуль Windows (C++ / MsQuic + WinHTTP)
-│   ├── msquic.h                    # Заголовки Microsoft QUIC API
-│   └── msquic_winuser.h
+Apple/
+├── build.sh                        # Сборка Apple-платформ и архивов plugins/<платформа>/data.tgz
+├── deployLocal.sh                  # То же + выкладка в ~/Solar2DPlugins
+├── metadata.lua                    # Копия plugins/metadata.lua (сборщик читает staticLibs)
 ├── plugin/
-│   └── Makefile                    # Makefile для компиляции .dylib / .so под macOS/Linux
-├── BuiltPlugin/                    # Результаты компиляции плагина под Solar2D Native
-│   ├── iphone/
-│   └── iphone-sim/
-├── plugin_http3.lua                # Единый гибридный Lua-модуль плагина
-├── metadata.lua                    # Файл метаданных платформенной сборки Solar2D
-├── build.sh                        # Автоматический скрипт сборки под iOS
-├── build.settings                  # Настройки проекта Solar2D
+│   ├── Makefile                    # Универсальный http3.dylib для стенда main.lua
+│   └── http3.dylib                 # Результат этого Makefile
+├── shared/include/                 # Заголовки Corona и Lua для компиляции
+├── build.settings                  # Настройки стенда Solar2D
 ├── config.lua                      # Параметры экрана Solar2D
-├── main.lua                        # Интерактивное приложение Solar2D с дашбордом метрик
-├── test_runner.lua                 # CLI скрипт для проведения автоматизированного стресс-теста (2500 reqs)
-└── README.md                       # Полное руководство на русском языке
+├── main.lua                        # Интерактивный стенд с дашбордом метрик
+├── test_runner.lua                 # CLI-прогон стресс-теста
+└── README.md                       # Это руководство
 ```
+
+Сам нативный исходник лежит не здесь, а в корне репозитория:
+`shared/SimulatorPluginLibrary.mm` — он один на iOS и macOS.
 
 ---
 
 ### 🛠 Сборка и деплой плагина:
 
-1. **Локальный деплой в Solar2D Simulator (убирает предупреждения)**:
-   При локальной разработке выполните скрипт:
+1. **Сборка Apple-платформ** (нужен macOS с Xcode — под Windows они не
+   собираются вовсе):
    ```bash
-   cd 3
-   ./deployLocal.sh
+   Apple/build.sh                # соберёт iphone, iphone-sim, macOS, mac-sim
+   Apple/build.sh --proverit     # только показать состав архивов
    ```
-   Скрипт автоматически соберёт нативную библиотеку `http3.dylib`, упакует платформенные архивы `data.tgz` и зарегистрирует плагин в `~/Solar2DPlugins/ovh.azi/plugin.http3/`.
+   Скрипт компилирует `shared/SimulatorPluginLibrary.mm` под iOS (arm64),
+   симулятор iOS (arm64 + x86_64) и macOS (arm64 + x86_64), раскладывает
+   результат по `plugins/<платформа>/`, пересобирает `data.tgz` и проверяет,
+   что в библиотеке остались точки входа `luaopen_plugin_http3_ntv` и
+   `luaopen_plugin_http3_native`.
+
+   Имя библиотеки в архиве — `libplugin_http3_native.a`, и оно не произвольно:
+   сборщик iOS внутри Solar2D читает `metadata.plugin.staticLibs` и передаёт
+   компоновщику `-lplugin_http3_native`.
+
+2. **Локальный деплой в Solar2D Simulator (убирает предупреждения)**:
+   ```bash
+   Apple/deployLocal.sh
+   ```
+   Соберёт то же самое и зарегистрирует плагин в
+   `~/Solar2DPlugins/ovh.azi/plugin.http3/`. Ключ `--bez-sborki` выкладывает
+   готовые архивы, ничего не пересобирая.
 
 2. **Использование в проекте Solar2D**:
 
