@@ -191,8 +191,26 @@ static const NSTimeInterval kProgressPauza = 0.5;
         // Настройка сессии NSURLSession
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
         config.HTTPMaximumConnectionsPerHost = 64;
+        // Сколько ждать ОЧЕРЕДНЫХ данных. Значение перекрывается на каждом
+        // запросе из params.timeout (см. requestWithURL ниже), здесь оно
+        // остаётся только запасным.
         config.timeoutIntervalForRequest = 30.0;
-        config.timeoutIntervalForResource = 60.0;
+
+        // Потолок на ВСЮ передачу. Здесь стояли 60 секунд, и это был предел на
+        // размер передаваемого: всё, что не укладывалось в минуту, обрывалось
+        // на середине с «The request timed out» — независимо от того, сколько
+        // просил вызывающий и шли ли данные ровно, без единого простоя.
+        // Замер: запрос с timeout = 300 к источнику, отдающему ровно 90 секунд,
+        // обрывался на 60-й, приняв 491 520 байт из 737 280.
+        //
+        // Задать его на отдельный запрос нельзя — свойство сессии, и сессия
+        // одна на все запросы. Поэтому потолка здесь нет вовсе (7 суток —
+        // значение Apple по умолчанию), а от зависшей передачи защищает
+        // timeoutIntervalForRequest: он считает простой, а не общее время.
+        // Так же ведут себя и остальные платформы: на Android запрос отменяет
+        // таймер по timeout вызывающего, на Windows по нему же идёт ожидание,
+        // и ни там, ни там скрытой минуты нет.
+        config.timeoutIntervalForResource = 604800.0;
 
         // Отключение локального кэша и куки для изоляции сетевого слоя
         config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
