@@ -270,9 +270,82 @@ static void RemoveCancelledId(int id) {
     }
 }
 
+// ===========================================================================
+// ПРОГРЕСС ПЕРЕДАЧИ
+//
+// Слой Windows опросный: Lua дёргает checkRequest каждый кадр и получает либо
+// nil («ещё идёт»), либо готовый результат. Событий, как на Android и Apple,
+// тут нет и взяться им неоткуда, поэтому прогресс устроен иначе: нативный слой
+// ведёт СЧЁТЧИКИ, а обёртка читает их тем же опросом и сама превращает в фазы
+// began/progress/ended. Контракт для вызывающего от этого не меняется.
+//
+// Хранилище — кольцо фиксированного размера, как у отменённых. Куча тут не
+// нужна: запись живёт ровно столько, сколько запрос, и переполнение кольца
+// значит лишь то, что у самого старого запроса пропадёт индикатор, а не утечку.
+#define MAX_PROGRESS_SLOTS 64
+
+typedef struct RequestProgress {
+    int id;              // 0 = слот свободен
+    long long sent;      // байт тела отправлено
+    long long sendTotal; // сколько всего отправлять, -1 неизвестно
+    long long received;  // байт принято
+    long long recvTotal; // Content-Length ответа, -1 если сервер не сообщил
+} RequestProgress;
+
+static RequestProgress g_Progress[MAX_PROGRESS_SLOTS];
+static int g_ProgressNext = 0;
+
+// Все три функции ниже зовутся из РАЗНЫХ потоков (QUIC-колбэк, поток WinHTTP,
+// поток Lua), поэтому каждая берёт ту же критическую секцию, что и результаты.
+static void ProgressStart(int id, long long sendTotal) {
+    EnterCriticalSection(&g_CritSec);
+    // Сначала ищем СВОБОДНЫЙ слот и только потом затираем по кругу: пачка из
+    // полусотни параллельных запросов (так гоняет стенд) иначе вытеснила бы
+    // живые записи, и у части запросов индикатор замер бы на месте.
+    RequestProgress* p = NULL;
+    for (int i = 0; i < MAX_PROGRESS_SLOTS; i++) {
+        if (g_Progress[i].id == 0) { p = &g_Progress[i]; break; }
+    }
+    if (!p) {
+        p = &g_Progress[g_ProgressNext];
+        g_ProgressNext = (g_ProgressNext + 1) % MAX_PROGRESS_SLOTS;
+    }
+    p->id = id;
+    p->sent = 0;
+    p->sendTotal = sendTotal;
+    p->received = 0;
+    p->recvTotal = -1;
+    LeaveCriticalSection(&g_CritSec);
+}
+
+static RequestProgress* ProgressFind(int id) {
+    for (int i = 0; i < MAX_PROGRESS_SLOTS; i++) {
+        if (g_Progress[i].id == id) return &g_Progress[i];
+    }
+    return NULL;
+}
+
+// dReceived/dSent — ПРИРАЩЕНИЯ, recvTotal — абсолютное значение или -1.
+static void ProgressAdd(int id, long long dReceived, long long dSent, long long recvTotal) {
+    EnterCriticalSection(&g_CritSec);
+    RequestProgress* p = ProgressFind(id);
+    if (p) {
+        p->received += dReceived;
+        p->sent += dSent;
+        if (recvTotal >= 0) p->recvTotal = recvTotal;
+    }
+    LeaveCriticalSection(&g_CritSec);
+}
+
 // Добавление результата запроса в потокобезопасный список с проверкой на отмену и очисткой старых результатов
 static void AddResult(int id, int is_error, int status, const char* data, int len, const char* transport) {
     EnterCriticalSection(&g_CritSec);
+
+    // Запрос кончился — слот прогресса больше не нужен. Освобождаем ДО
+    // проверки на отмену: у отменённого запроса результат отбрасывается, но
+    // слот освободить всё равно надо, иначе кольцо забьётся мертвыми записями.
+    RequestProgress* pr = ProgressFind(id);
+    if (pr) pr->id = 0;
 
     // Обновление метрик задач
     if (g_ActiveTasksCount > 0) g_ActiveTasksCount--;
@@ -462,6 +535,10 @@ typedef struct AsyncRequestContext {
     // запрос, которому вызывающий разрешил больше, чем зашито, обрывался раньше
     // срока и выглядел как отказ транспорта - хотя ни сеть, ни сервер ни при чём.
     int timeout_ms;
+    // Просил ли вызывающий события хода передачи. Отдельный флаг, а не всегда:
+    // слотов прогресса конечное число, и занимать их под каждый запрос
+    // приложения незачем — счётчики ждёт только выгрузка и скачивание файлов.
+    int progress;
 } AsyncRequestContext;
 
 // ===========================================================================
@@ -1245,9 +1322,21 @@ static long __cdecl RequestStreamCallback(HQUIC Stream, void* Context, QUIC_STRE
     LogHexVal("RequestStreamCallback: Event->Type", Event->Type);
     switch (Event->Type) {
         case QUIC_STREAM_EVENT_RECEIVE: {
+            long long prinyato = 0;
             for (uint32_t i = 0; i < Event->RECEIVE.BufferCount; i++) {
                 GrowBufferAppend(&state->streamAccum, &state->streamAccumLen, &state->streamAccumCap,
                                   Event->RECEIVE.Buffers[i].Buffer, (int)Event->RECEIVE.Buffers[i].Length);
+                prinyato += (long long)Event->RECEIVE.Buffers[i].Length;
+            }
+            // Считаем байты ПОТОКА, а не тела: разбор кадров HTTP/3 идёт один
+            // раз в конце (ParseHttp3ResponseStream), и до него длина тела
+            // неизвестна. Поэтому здесь же recvTotal остаётся -1 — «сервер не
+            // сказал, сколько всего». Врать процентом нельзя: заголовки и
+            // обрамление кадров в эти байты входят, и полоса дошла бы до ста
+            // процентов раньше данных. Вызывающий на -1 показывает
+            // неопределённое ожидание — ровно как при ответе без Content-Length.
+            if (state->req && state->req->progress) {
+                ProgressAdd(state->req->id, prinyato, 0, -1);
             }
             // Проверяем наличие флага FIN в самом событии приёма данных.
             // Сервера HTTP/3 (например, Cloudflare) могут передавать FIN вместе с последним кадром данных,
@@ -1347,6 +1436,14 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
             bufCount = 1;
         }
         long sSend = api->StreamSend(state->requestStream, state->sendBuffers, bufCount, QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN, NULL);
+        // Тело уходит ОДНИМ StreamSend вместе с FIN, промежуточных значений
+        // тут взяться неоткуда: либо ещё ничего не отправлено, либо отправлено
+        // всё. Поэтому отправка засчитывается целиком и сразу, а дробить её
+        // ради красивой полосы значило бы трогать сборку кадров — то самое
+        // место, где уже была ошибка с длиной кадра тела.
+        if (sSend == 0 && req && req->progress && req->body_len > 0) {
+            ProgressAdd(req->id, 0, (long long)req->body_len, -1);
+        }
         // Метка пути и возраст соединения — чтобы по журналу понять, отказы
         // приходятся на тёплые соединения или на холодные, и связаны ли они с
         // тем, сколько соединение простояло.
@@ -1853,6 +1950,29 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         }
     }
 
+    // Content-Length ответа — то самое «сколько всего», которого нет у QUIC.
+    // Здесь заголовки уже разобраны WinHTTP, и длина достаётся одним запросом.
+    // Нет её (chunked или сервер смолчал) — оставляем -1, вызывающий покажет
+    // неопределённое ожидание.
+    if (race->req && race->req->progress) {
+        wchar_t w_len[32];
+        unsigned long w_len_sz = sizeof(w_len);
+        long long vsego = -1;
+        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH, NULL, w_len, &w_len_sz, NULL)) {
+            long long acc = 0;
+            int li = 0;
+            while (w_len[li] >= L'0' && w_len[li] <= L'9') {
+                acc = acc * 10 + (w_len[li] - L'0');
+                li++;
+            }
+            if (li > 0) vsego = acc;
+        }
+        // Тело запроса WinHttpSendRequest отдаёт одним куском, дробить его
+        // нечем — засчитываем отправку целиком здесь же, раз ответ уже пришёл.
+        ProgressAdd(race->req->id, 0,
+                    race->req->body_len > 0 ? (long long)race->req->body_len : 0, vsego);
+    }
+
     void* heap = GetProcessHeap();
     char* resp_buf = NULL;
     int resp_cap = 4096;
@@ -1871,6 +1991,12 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         }
         for (unsigned long i = 0; i < bytes_read; i++) {
             resp_buf[resp_len++] = read_buf[i];
+        }
+        // Здесь, в отличие от QUIC, считаются байты ИМЕННО ТЕЛА: WinHttpReadData
+        // отдаёт уже разобранный поток, без заголовков и обрамления. Вместе с
+        // Content-Length выше это даёт честный процент.
+        if (race->req && race->req->progress) {
+            ProgressAdd(race->req->id, (long long)bytes_read, 0, -1);
         }
     }
     resp_buf[resp_len] = '\0';
@@ -2082,6 +2208,19 @@ static int initiateRequest( lua_State *L )
         }
         lua_pop(L, 1);
 
+        // ЗНАЧЕНИЕ БЫВАЕТ И СТРОКОЙ. В Solar2D params.progress принимает
+        // "upload" либо "download"; true понимается как «оба направления».
+        // Нативному слою направление безразлично — он лишь ведёт счётчики, а
+        // какие из них показывать, решает обёртка. Здесь достаточно факта
+        // «прогресс нужен», иначе слот не занимается вовсе.
+        lua_getfield(L, tbl_idx, "progress");
+        if (lua_isboolean(L, -1)) {
+            req->progress = lua_toboolean(L, -1) ? 1 : 0;
+        } else if (lua_isstring(L, -1)) {
+            req->progress = 1;
+        }
+        lua_pop(L, 1);
+
         lua_getfield(L, tbl_idx, "body");
         if (lua_isstring(L, -1)) {
             size_t b_len = 0;
@@ -2147,6 +2286,12 @@ static int initiateRequest( lua_State *L )
     EnterCriticalSection(&g_CritSec);
     g_ActiveTasksCount++;
     LeaveCriticalSection(&g_CritSec);
+
+    // Слот заводится ДО запуска потоков: иначе первая же порция ответа пришла
+    // бы раньше счётчика и не была учтена.
+    if (req->progress) {
+        ProgressStart(req->id, req->body_len > 0 ? (long long)req->body_len : -1);
+    }
 
     LogMsg("initiateRequest: Создание фонового потока-оркестратора гонки...");
     unsigned long thread_id;
@@ -2223,6 +2368,22 @@ static int checkRequest( lua_State *L )
     lua_pushinteger(L, res->response_len);
     lua_settable(L, -3);
 
+    // Завершение — тоже фаза, как на Android и Apple. Без неё вызывающий,
+    // написанный по тем платформам, не узнал бы итог: он смотрит на phase.
+    lua_pushstring(L, "phase");
+    lua_pushstring(L, "ended");
+    lua_settable(L, -3);
+
+    // На завершении принято ровно столько, сколько принято: ожидаемое и
+    // переданное совпадают по определению, гадать больше не о чем.
+    lua_pushstring(L, "bytesTransferred");
+    lua_pushnumber(L, (lua_Number)res->response_len);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "bytesEstimated");
+    lua_pushnumber(L, (lua_Number)res->response_len);
+    lua_settable(L, -3);
+
     lua_pushstring(L, "transport");
     lua_pushstring(L, res->transport);
     lua_settable(L, -3);
@@ -2247,6 +2408,57 @@ static int checkRequest( lua_State *L )
     void* heap = GetProcessHeap();
     if (res->response_data) HeapFree(heap, 0, res->response_data);
     HeapFree(heap, 0, res);
+
+    return 1;
+}
+
+// Текущие счётчики передачи. Возвращает nil, если запрос прогресса не просил
+// или уже завершился — обёртка на nil просто ничего не показывает.
+//
+// Событий тут нет по устройству слоя, есть СОСТОЯНИЕ: Lua и так опрашивает
+// checkRequest каждый кадр, этим же опросом забираются и счётчики. Фазы
+// began/progress/ended из них делает обёртка — так контракт для вызывающего
+// совпадает с Android и Apple, где события приходят сами.
+static int checkProgress( lua_State *L )
+{
+    int id = (int)luaL_checkinteger(L, 1);
+
+    long long sent = 0, sendTotal = -1, received = 0, recvTotal = -1;
+    int nashli = 0;
+
+    EnterCriticalSection(&g_CritSec);
+    RequestProgress* p = ProgressFind(id);
+    if (p) {
+        sent = p->sent;
+        sendTotal = p->sendTotal;
+        received = p->received;
+        recvTotal = p->recvTotal;
+        nashli = 1;
+    }
+    LeaveCriticalSection(&g_CritSec);
+
+    if (!nashli) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_newtable(L);
+
+    lua_pushstring(L, "bytesSent");
+    lua_pushnumber(L, (lua_Number)sent);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "bytesTotalSend");
+    lua_pushnumber(L, (lua_Number)sendTotal);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "bytesReceived");
+    lua_pushnumber(L, (lua_Number)received);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "bytesTotalReceive");
+    lua_pushnumber(L, (lua_Number)recvTotal);
+    lua_settable(L, -3);
 
     return 1;
 }
@@ -2388,6 +2600,7 @@ static int Open( lua_State *L )
         { "request", initiateRequest },
         { "initiateRequest", initiateRequest },
         { "checkRequest", checkRequest },
+        { "checkProgress", checkProgress },
         { "cancel", cancelRequest },
         { "getMemoryStats", getMemoryStats },
         { "collectGarbage", collectGarbage },

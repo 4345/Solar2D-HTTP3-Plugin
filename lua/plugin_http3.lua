@@ -261,6 +261,66 @@ function M.request(url, method, listener, params)
                 local startTime = (system and system.getTimer) and system.getTimer() or (os.time() * 1000)
                 local maxWaitMs = (timeout + 2.0) * 1000
 
+                -- ПРОГРЕСС В ОПРОСНОМ СЛОЕ. Событий там нет по устройству, есть
+                -- состояние: нативная часть ведёт счётчики, а фазы
+                -- began/progress/ended делаются здесь. Для вызывающего это тот
+                -- же контракт, что на Android и Apple, где события приходят
+                -- сами, — разница остаётся только внутри плагина.
+                local napravlenie = params and params.progress
+                local nuzhen_priyom, nuzhna_otpravka = false, false
+                if napravlenie == true then
+                    nuzhen_priyom, nuzhna_otpravka = true, true
+                elseif type(napravlenie) == "string" then
+                    local n = napravlenie:lower()
+                    nuzhen_priyom = (n == "download")
+                    nuzhna_otpravka = (n == "upload")
+                end
+                local sledim = (nuzhen_priyom or nuzhna_otpravka) and cLib.checkProgress ~= nil
+                local nachalo_poslano, poslednee_sobytie = false, 0
+                -- Порог тот же, что на Android и Apple: не чаще раза в
+                -- полсекунды. Опрос идёт на КАЖДОМ кадре, то есть до
+                -- шестидесяти раз в секунду, и без порога слушатель получал бы
+                -- событие на каждый кадр.
+                local PAUZA_MS = 500
+
+                local function otdat_progress(faza, peredano, vsego)
+                    vyzvat_slushatelya(listener, {
+                        name = "http3", requestId = reqId, phase = faza,
+                        isError = false, isNative = true,
+                        bytesTransferred = peredano, bytesEstimated = vsego,
+                    })
+                end
+
+                local function proverit_progress(now)
+                    if not sledim then return end
+                    local pr = cLib.checkProgress(reqId)
+                    if not pr then return end
+                    -- Отправку показываем, пока она не закончилась, дальше —
+                    -- приём. Так вызывающий видит одну непрерывную полосу, а не
+                    -- две наперегонки.
+                    local peredano, vsego
+                    if nuzhna_otpravka and pr.bytesTotalSend and pr.bytesTotalSend > 0
+                            and pr.bytesSent < pr.bytesTotalSend then
+                        peredano, vsego = pr.bytesSent, pr.bytesTotalSend
+                    elseif nuzhen_priyom then
+                        peredano, vsego = pr.bytesReceived, pr.bytesTotalReceive
+                    elseif nuzhna_otpravka then
+                        peredano, vsego = pr.bytesSent, pr.bytesTotalSend
+                    else
+                        return
+                    end
+                    if not nachalo_poslano then
+                        nachalo_poslano = true
+                        poslednee_sobytie = now
+                        otdat_progress("began", 0, vsego or -1)
+                        return
+                    end
+                    if now - poslednee_sobytie >= PAUZA_MS then
+                        poslednee_sobytie = now
+                        otdat_progress("progress", peredano or 0, vsego or -1)
+                    end
+                end
+
                 local function check(evt)
                     local pollResult = cLib.checkRequest(reqId)
                     if pollResult then
@@ -272,6 +332,7 @@ function M.request(url, method, listener, params)
                     else
                         -- Предохранитель от утечки памяти: если нативный модуль завис или не вернул статус
                         local now = (system and system.getTimer) and system.getTimer() or (os.time() * 1000)
+                        proverit_progress(now)
                         if (now - startTime) > maxWaitMs then
                             if Runtime and Runtime.removeEventListener and activeListeners[reqId] then
                                 Runtime:removeEventListener("enterFrame", activeListeners[reqId])
@@ -417,7 +478,12 @@ end
 function M.progress_podderzhivaetsya()
     local cLib = loadNativeLibrary()
     if not cLib then return false end
-    return cLib.checkRequest == nil
+    -- Push-слои (Android, Apple) шлют события сами — у них нет checkRequest.
+    -- Опросный слой Windows событий не шлёт, но с некоторых пор ведёт счётчики
+    -- и отдаёт их через checkProgress, а фазы из них делает обёртка. Поэтому
+    -- ответ теперь не «есть ли опрос», а «есть ли чем показать ход передачи».
+    -- Старые сборки Windows без checkProgress по-прежнему отвечают false.
+    return cLib.checkRequest == nil or cLib.checkProgress ~= nil
 end
 
 --- Скачивание файла: те же аргументы, что у network.download в Solar2D.
