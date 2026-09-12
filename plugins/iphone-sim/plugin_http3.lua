@@ -277,6 +277,13 @@ function M.request(url, method, listener, params)
                 end
                 local sledim = (nuzhen_priyom or nuzhna_otpravka) and cLib.checkProgress ~= nil
                 local nachalo_poslano, poslednee_sobytie = false, 0
+                -- Сколько было передано на ПРОШЛОМ отданном событии. Нужно,
+                -- чтобы не отдавать progress, когда ничего не сдвинулось.
+                local peredano_na_proshlom = -1
+                -- Итог выгрузки запоминаем, ПОКА СЛОТ ЖИВ: нативный слой
+                -- освобождает его в момент публикации результата, и к
+                -- завершению checkProgress уже отдаёт nil.
+                local vsego_otpravki = nil
                 -- Порог тот же, что на Android и Apple: не чаще раза в
                 -- полсекунды. Опрос идёт на КАЖДОМ кадре, то есть до
                 -- шестидесяти раз в секунду, и без порога слушатель получал бы
@@ -309,14 +316,41 @@ function M.request(url, method, listener, params)
                     else
                         return
                     end
+                    -- ФАЗЫ НАЧИНАЮТСЯ ТОЛЬКО С САМОЙ ПЕРЕДАЧЕЙ. Слот прогресса
+                    -- появляется сразу при создании запроса, и по одному его
+                    -- наличию began уходил немедленно, а дальше progress шёл по
+                    -- таймеру с нулями. На Windows перед передачей стоит гонка
+                    -- Happy Eyeballs: пока QUIC не сдался, не передаётся ВООБЩЕ
+                    -- ничего, и вызывающий две с лишним секунды видел замерший
+                    -- на нуле индикатор с неизвестным итогом — хуже, чем
+                    -- никаких событий. Замерено: began на 0 мс, четыре progress
+                    -- с 0/-1 до 2000 мс, и только на 2500 мс честное
+                    -- 86016/102400.
+                    --
+                    -- Признак начала — любой из двух: байты пошли либо стал
+                    -- известен итог. Оба приходят от нативного слоя и означают,
+                    -- что передача уже идёт. У выгрузки итог известен сразу
+                    -- (длина тела), поэтому began уходит немедленно — так и
+                    -- надо: отправка начинается тут же.
+                    if nuzhna_otpravka and pr.bytesTotalSend and pr.bytesTotalSend > 0 then
+                        vsego_otpravki = pr.bytesTotalSend
+                    end
+                    local peredacha_poshla = (peredano or 0) > 0 or (vsego or -1) >= 0
                     if not nachalo_poslano then
+                        if not peredacha_poshla then return end
                         nachalo_poslano = true
                         poslednee_sobytie = now
+                        peredano_na_proshlom = peredano or 0
                         otdat_progress("began", 0, vsego or -1)
                         return
                     end
-                    if now - poslednee_sobytie >= PAUZA_MS then
+                    -- Порог по времени — НЕОБХОДИМОЕ условие, но не достаточное:
+                    -- событие отдаётся только если с прошлого раза действительно
+                    -- прибавилось. Иначе полоса «дышит» на месте.
+                    if now - poslednee_sobytie >= PAUZA_MS
+                            and (peredano or 0) > peredano_na_proshlom then
                         poslednee_sobytie = now
+                        peredano_na_proshlom = peredano or 0
                         otdat_progress("progress", peredano or 0, vsego or -1)
                     end
                 end
@@ -324,6 +358,18 @@ function M.request(url, method, listener, params)
                 local function check(evt)
                     local pollResult = cLib.checkRequest(reqId)
                     if pollResult then
+                        -- У ВЫГРУЗКИ завершение должно мерить выгруженное, а не
+                        -- ответ. Нативный слой кладёт в bytesTransferred длину
+                        -- ТЕЛА ОТВЕТА — для скачивания это верно, а для выгрузки
+                        -- полоса прыгала с масштаба тела запроса на масштаб
+                        -- ответа: began говорил 0/262144, а ended — 125959/125959.
+                        -- Подменяем только когда запрос выгрузочный И не просил
+                        -- приём: при progress = true вызывающему нужны оба, и
+                        -- там счёт по ответу остаётся прежним.
+                        if nuzhna_otpravka and not nuzhen_priyom and vsego_otpravki then
+                            pollResult.bytesTransferred = vsego_otpravki
+                            pollResult.bytesEstimated = vsego_otpravki
+                        end
                         if Runtime and Runtime.removeEventListener and activeListeners[reqId] then
                             Runtime:removeEventListener("enterFrame", activeListeners[reqId])
                         end

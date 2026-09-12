@@ -75,6 +75,7 @@ local function progon(imya, url, metod, params, zhdat)
     krutit(zhdat or 30, function() return itog ~= nil end)
 
     print(imya)
+    print("  адрес: " .. url)
     print(string.format("  транспорт: %s", tostring(itog and (itog.protocol or itog.transport))))
     print(string.format("  промежуточных событий: %d  [%s]", #fazy, table.concat(fazy, ",")))
     if #chisla > 0 then
@@ -84,10 +85,10 @@ local function progon(imya, url, metod, params, zhdat)
               #chisla > 6 and " ..." or ""))
     end
     if itog then
-        print(string.format("  итог: status=%s isError=%s фаза=%s передано=%s ожидалось=%s длина тела=%s",
-            tostring(itog.status), tostring(itog.isError), tostring(itog.phase),
-            tostring(itog.bytesTransferred), tostring(itog.bytesEstimated),
-            tostring(itog.response and #itog.response)))
+        print(string.format("  итог: status=%s isError=%s error=%s фаза=%s передано=%s ожидалось=%s длина тела=%s",
+            tostring(itog.status), tostring(itog.isError), tostring(itog.error),
+            tostring(itog.phase), tostring(itog.bytesTransferred),
+            tostring(itog.bytesEstimated), tostring(itog.response and #itog.response)))
     else
         print("  итог: ОТВЕТА НЕ БЫЛО")
     end
