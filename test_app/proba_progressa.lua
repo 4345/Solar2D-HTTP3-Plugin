@@ -108,8 +108,12 @@ progon("2. download по HTTP/3 (ожидается bytesEstimated = -1)",
 --    куском на обоих транспортах, промежуточным значениям взяться неоткуда, и
 --    это не дефект. На push-платформах (Android, Apple) тот же стенд покажет и
 --    промежуточные — там отправку считает сам сетевой стек.
+-- Адрес именно такой: httpbin.org по QUIC для POST не отвечает, плагин уходит
+-- на запасной network.request, а в CLI это заглушка стенда — и случай проверял
+-- заглушку, а не плагин (status=-1, фаза nil). cloudflare-quic.com принимает
+-- POST по QUIC, проверено отдельно.
 progon("3. upload (на Windows ожидаются только began и ended)",
-       "https://httpbin.org/post", "POST",
+       "https://cloudflare-quic.com/", "POST",
        { progress = "upload", body = string.rep("A", 262144) })
 
 -- 4. Без progress. Ожидаем НОЛЬ промежуточных событий.
