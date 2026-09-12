@@ -83,6 +83,52 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
     }
 }
 
+// Не чаще этого шлём события хода передачи. Порции приходят часто, и на
+// быстрой сети их десятки в секунду; каждое событие — задача в очередь
+// Lua-потока, а перерисовывать индикатор чаще двух раз в секунду глазу всё
+// равно нечего. Последнее значение доезжает с фазой "ended", так что на
+// точности итога порог не сказывается. Порог тот же, что у Android.
+static const NSTimeInterval kProgressPauza = 0.5;
+
+// Контекст одной задачи. Появился вместе с прогрессом: обработчик-блок
+// (completionHandler) вызывается ОДИН раз, готовым ответом, и промежуточных
+// событий из него не достать — NSURLSession не зовёт didReceiveData, когда
+// задаче дан блок. Поэтому тело собирается делегатом, а всё, что делегату
+// нужно знать о запросе, живёт здесь.
+@interface HTTP3Zadacha : NSObject
+@property (nonatomic, assign) NSInteger reqId;
+@property (nonatomic, assign) CoronaLuaRef listenerRef;
+@property (nonatomic, assign) lua_State *mainLuaState;
+@property (nonatomic, strong) NSMutableData *telo;
+// -1 означает «сервер не сказал, сколько всего» — ровно так же ведёт себя
+// Solar2D, когда в ответе нет Content-Length. Полосу в этом случае рисовать
+// не по чему, и вызывающий должен показывать неопределённое ожидание.
+@property (nonatomic, assign) long long ozhidaetsyaPriyoma;
+@property (nonatomic, assign) BOOL progressPriyoma;
+@property (nonatomic, assign) BOOL progressOtpravki;
+@property (nonatomic, assign) BOOL nachaloPriyoma;
+@property (nonatomic, assign) BOOL nachaloOtpravki;
+// Отсчёт троттлинга у каждого направления свой. С одним общим полем при
+// progress = true (оба направления) отправка и приём отнимали окно друг у
+// друга: событие одного направления сдвигало порог другому. На Android они
+// тоже независимы — там счётчик отправки живёт в самом UploadDataProvider.
+@property (nonatomic, assign) NSTimeInterval posledneePriyoma;
+@property (nonatomic, assign) NSTimeInterval posledneeOtpravki;
+@end
+
+@implementation HTTP3Zadacha
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _telo = [NSMutableData data];
+        _ozhidaetsyaPriyoma = -1;
+        _posledneePriyoma = 0;
+        _posledneeOtpravki = 0;
+    }
+    return self;
+}
+@end
+
 // Менеджер сетевых запросов HTTP/3
 @interface HTTP3PluginManager : NSObject <NSURLSessionDataDelegate, NSURLSessionTaskDelegate>
 
@@ -92,6 +138,9 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
 // URLSession:task:didFinishCollectingMetrics: — единственном месте, где
 // NSURLSession сообщает, ЧТО он на самом деле использовал.
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *protokolZadachi;
+// Контексты задач по taskIdentifier: делегат получает только задачу, а ему
+// нужны и слушатель, и накопленное тело, и флаги прогресса.
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, HTTP3Zadacha *> *zadachi;
 @property (nonatomic, assign) NSInteger nextRequestId;
 @property (nonatomic, assign) int64_t totalCompleted;
 @property (nonatomic, assign) int64_t totalFailed;
@@ -105,6 +154,8 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
                     headers:(NSDictionary *)headers
                        body:(NSData *)bodyData
                     timeout:(NSTimeInterval)timeout
+            progressOtpravki:(BOOL)progressOtpravki
+             progressPriyoma:(BOOL)progressPriyoma
                    luaState:(lua_State *)L
                 listenerRef:(CoronaLuaRef)listenerRef;
 
@@ -130,6 +181,7 @@ static inline void SafeCoronaLuaDispatchEvent(lua_State *L, CoronaLuaRef ref) {
     if (self) {
         _activeTasks = [[NSMutableDictionary alloc] init];
         _protokolZadachi = [[NSMutableDictionary alloc] init];
+        _zadachi = [[NSMutableDictionary alloc] init];
         _nextRequestId = 1;
         _totalCompleted = 0;
         _totalFailed = 0;
@@ -200,12 +252,53 @@ didFinishCollectingMetrics:(NSURLSessionTaskMetrics *)metrics {
     }
 }
 
+// Одно событие хода передачи в Lua. Поля те же, что у network.request Solar2D:
+// phase ("began" / "progress"), bytesTransferred, bytesEstimated. Ссылку на
+// слушателя НЕ отпускаем — запрос ещё идёт, событий будет много, и освободит
+// её завершение.
+static void OtpravitProgress(HTTP3Zadacha *z, NSString *faza,
+                             long long peredano, long long ozhidaetsya) {
+    if (!z || !z.listenerRef) return;
+    CoronaLuaRef ref = z.listenerRef;
+    lua_State *mainL = z.mainLuaState;
+    NSInteger reqId = z.reqId;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            lua_State *L = SafeGetCoronaThread(mainL);
+            if (!L) return;
+            SafeCoronaLuaNewEvent(L, "http3");
+
+            lua_pushinteger(L, reqId);
+            lua_setfield(L, -2, "requestId");
+
+            lua_pushstring(L, faza.UTF8String);
+            lua_setfield(L, -2, "phase");
+
+            lua_pushboolean(L, 0);
+            lua_setfield(L, -2, "isError");
+
+            lua_pushnumber(L, (lua_Number)peredano);
+            lua_setfield(L, -2, "bytesTransferred");
+
+            lua_pushnumber(L, (lua_Number)ozhidaetsya);
+            lua_setfield(L, -2, "bytesEstimated");
+
+            lua_pushboolean(L, 1);
+            lua_setfield(L, -2, "isNative");
+
+            SafeCoronaLuaDispatchEvent(L, ref);
+        }
+    });
+}
+
 // Запуск сетевого запроса HTTP/3
 - (NSInteger)requestWithURL:(NSString *)urlStr
                      method:(NSString *)method
                     headers:(NSDictionary *)headers
                        body:(NSData *)bodyData
                     timeout:(NSTimeInterval)timeout
+            progressOtpravki:(BOOL)progressOtpravki
+             progressPriyoma:(BOOL)progressPriyoma
                    luaState:(lua_State *)L
                 listenerRef:(CoronaLuaRef)listenerRef {
     @autoreleasepool {
@@ -241,168 +334,256 @@ didFinishCollectingMetrics:(NSURLSessionTaskMetrics *)metrics {
             request.HTTPBody = bodyData;
         }
 
-        __block NSInteger reqId = 0;
+        NSInteger reqId = 0;
         @synchronized (self) {
             reqId = self.nextRequestId++;
         }
         NSNumber *reqIdNum = @(reqId);
 
-        lua_State *mainLuaState = SafeGetCoronaThread(L);
+        // Задача БЕЗ обработчика-блока: с ним NSURLSession не зовёт
+        // didReceiveData, и промежуточных событий приёма не будет вовсе.
+        NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request];
 
-        __weak __typeof__(self) weakSelf = self;
-        // Идентификатор задачи нужен в обработчике, чтобы забрать метрику с
-        // именем согласованного протокола. Сама задача создаётся ниже, поэтому
-        // ссылка объявлена __block и заполняется после создания.
-        __block NSURLSessionDataTask *ssylkaNaZadachu = nil;
-        NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-            // Использование @autoreleasepool внутри фонового блока для немедленного освобождения объектовых ресурсов
-            @autoreleasepool {
-                __typeof__(self) strongSelf = weakSelf;
-                if (!strongSelf) return;
+        HTTP3Zadacha *z = [[HTTP3Zadacha alloc] init];
+        z.reqId = reqId;
+        z.listenerRef = listenerRef;
+        z.mainLuaState = SafeGetCoronaThread(L);
+        z.progressOtpravki = progressOtpravki;
+        z.progressPriyoma = progressPriyoma;
 
-                @synchronized (strongSelf) {
-                    [strongSelf.activeTasks removeObjectForKey:reqIdNum];
-                }
-
-                NSInteger statusCode = 0;
-
-                // Протокол берётся из метрики задачи, а не выдумывается. Если
-                // метрика не пришла, так и сообщаем — врать про HTTP/3 нельзя,
-                // на этом поле держится вся диагностика транспорта.
-                NSString *imyaProtokola = nil;
-                if (ssylkaNaZadachu) {
-                    NSNumber *klyuch = @(ssylkaNaZadachu.taskIdentifier);
-                    @synchronized (strongSelf) {
-                        imyaProtokola = strongSelf.protokolZadachi[klyuch];
-                        if (imyaProtokola) [strongSelf.protokolZadachi removeObjectForKey:klyuch];
-                    }
-                }
-                NSString *protocol;
-                if ([imyaProtokola hasPrefix:@"h3"]) {
-                    protocol = [NSString stringWithFormat:@"HTTP/3 (QUIC / %@)", imyaProtokola];
-                } else if ([imyaProtokola hasPrefix:@"h2"]) {
-                    protocol = [NSString stringWithFormat:@"HTTP/2.0 (%@)", imyaProtokola];
-                } else if (imyaProtokola.length > 0) {
-                    protocol = [NSString stringWithFormat:@"HTTP (%@)", imyaProtokola];
-                } else {
-                    protocol = @"HTTP (протокол не сообщён)";
-                }
-                NSString *transport = @"Native Apple Network.framework (NSURLSession)";
-                NSMutableDictionary *respHeaders = [NSMutableDictionary dictionary];
-
-                if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-                    NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
-                    statusCode = httpResp.statusCode;
-                    [respHeaders addEntriesFromDictionary:httpResp.allHeaderFields];
-                }
-
-                // ВЫСОКОПРОИЗВОДИТЕЛЬНЫЙ ПЕРЕНОС ДАННЫХ В LUA:
-                // Выделяем сырой C-буфер malloc() для передачи байтов в главный поток Lua.
-                // Это полностью предотвращает аккумуляцию объектов NSString/CFString в куче ARC.
-                void *responseBuf = NULL;
-                NSUInteger responseLen = 0;
-
-                if (data && data.length > 0) {
-                    @synchronized (strongSelf) { strongSelf.totalBytesReceived += data.length; }
-                    responseLen = data.length;
-                    responseBuf = malloc(responseLen);
-                    if (responseBuf) {
-                        [data getBytes:responseBuf length:responseLen];
-                    } else {
-                        responseLen = 0;
-                    }
-                }
-
-                // isError — ТОЛЬКО про сбой транспорта, как у network.request в
-                // Solar2D и как в версии для Windows. Код 4xx/5xx это нормально
-                // доставленный ответ: он приезжает в status, а разбирает его
-                // вызывающий. Раньше здесь стояло (error || statusCode >= 400),
-                // и ответ 401 выглядел для вызывающего обрывом связи — в
-                // частности, обновление истёкшего токена по коду 401 не
-                // срабатывало вовсе.
-                BOOL isError = (error != nil);
-                NSString *errorDesc = error ? error.localizedDescription : nil;
-
-                @synchronized (strongSelf) {
-                    if (isError) strongSelf.totalFailed++;
-                    else strongSelf.totalCompleted++;
-                }
-
-                // Перенос передачи результата в главный поток Corona Lua
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    @autoreleasepool {
-                        if (listenerRef) {
-                            lua_State *currentL = SafeGetCoronaThread(mainLuaState);
-                            if (currentL) {
-                                SafeCoronaLuaNewEvent(currentL, "http3");
-
-                                lua_pushinteger(currentL, reqId);
-                                lua_setfield(currentL, -2, "requestId");
-
-                                lua_pushinteger(currentL, statusCode);
-                                lua_setfield(currentL, -2, "status");
-
-                                lua_pushboolean(currentL, isError);
-                                lua_setfield(currentL, -2, "isError");
-
-                                if (errorDesc) {
-                                    lua_pushstring(currentL, errorDesc.UTF8String);
-                                    lua_setfield(currentL, -2, "error");
-                                    lua_pushstring(currentL, errorDesc.UTF8String);
-                                    lua_setfield(currentL, -2, "reason");
-                                } else {
-                                    lua_pushnil(currentL);
-                                    lua_setfield(currentL, -2, "error");
-                                }
-
-                                if (responseBuf && responseLen > 0) {
-                                    lua_pushlstring(currentL, (const char *)responseBuf, responseLen);
-                                    lua_setfield(currentL, -2, "response");
-                                } else {
-                                    lua_pushstring(currentL, "");
-                                    lua_setfield(currentL, -2, "response");
-                                }
-
-                                lua_pushinteger(currentL, responseLen);
-                                lua_setfield(currentL, -2, "bytesTotal");
-
-                                lua_pushstring(currentL, protocol.UTF8String);
-                                lua_setfield(currentL, -2, "protocol");
-
-                                lua_pushstring(currentL, transport.UTF8String);
-                                lua_setfield(currentL, -2, "transport");
-
-                                lua_pushboolean(currentL, YES);
-                                lua_setfield(currentL, -2, "isNative");
-
-                                lua_newtable(currentL);
-                                [respHeaders enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
-                                    lua_pushstring(currentL, [obj description].UTF8String);
-                                    lua_setfield(currentL, -2, [key description].UTF8String);
-                                }];
-                                lua_setfield(currentL, -2, "headers");
-
-                                SafeCoronaLuaDispatchEvent(currentL, listenerRef);
-                                SafeCoronaLuaDeleteRef(currentL, listenerRef);
-                            }
-                        }
-
-                        // Очистка выделенного C-буфера строго после завершения взаимодействия с Lua
-                        if (responseBuf) {
-                            free(responseBuf);
-                        }
-                    }
-                });
-            }
-        }];
-
-        ssylkaNaZadachu = task;
         @synchronized (self) {
             self.activeTasks[reqIdNum] = task;
+            self.zadachi[@(task.taskIdentifier)] = z;
         }
 
         [task resume];
         return reqId;
+    }
+}
+
+// --- Делегат: ход приёма ----------------------------------------------------
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    HTTP3Zadacha *z = nil;
+    @synchronized (self) { z = self.zadachi[@(dataTask.taskIdentifier)]; }
+    if (z) {
+        // expectedContentLength сам отдаёт -1 (NSURLResponseUnknownLength),
+        // когда Content-Length в ответе нет, — то же значение, что и у
+        // Android, менять его не на что.
+        z.ozhidaetsyaPriyoma = response.expectedContentLength;
+        if (z.progressPriyoma && !z.nachaloPriyoma) {
+            // "began" перед первой порцией: у network.request Solar2D передача
+            // начинается именно этой фазой, и вызывающий по ней ставит
+            // индикатор в ноль, а не додумывает начало по первому "progress".
+            z.nachaloPriyoma = YES;
+            OtpravitProgress(z, @"began", 0, z.ozhidaetsyaPriyoma);
+        }
+    }
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveData:(NSData *)data {
+    HTTP3Zadacha *z = nil;
+    @synchronized (self) { z = self.zadachi[@(dataTask.taskIdentifier)]; }
+    if (!z) return;
+
+    [z.telo appendData:data];
+
+    if (!z.progressPriyoma) return;
+    if (!z.nachaloPriyoma) {
+        // Ответа без заголовков не бывает, но если didReceiveResponse почему-то
+        // не пришёл, начало всё равно надо объявить — иначе вызывающий увидит
+        // "progress" без "began".
+        z.nachaloPriyoma = YES;
+        OtpravitProgress(z, @"began", 0, z.ozhidaetsyaPriyoma);
+    }
+    NSTimeInterval teper = [NSDate timeIntervalSinceReferenceDate];
+    if (teper - z.posledneePriyoma >= kProgressPauza) {
+        z.posledneePriyoma = teper;
+        OtpravitProgress(z, @"progress", (long long)z.telo.length, z.ozhidaetsyaPriyoma);
+    }
+}
+
+// --- Делегат: ход отправки --------------------------------------------------
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+   didSendBodyData:(int64_t)bytesSent
+    totalBytesSent:(int64_t)totalBytesSent
+totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
+    HTTP3Zadacha *z = nil;
+    @synchronized (self) { z = self.zadachi[@(task.taskIdentifier)]; }
+    if (!z || !z.progressOtpravki) return;
+
+    if (!z.nachaloOtpravki) {
+        z.nachaloOtpravki = YES;
+        OtpravitProgress(z, @"began", 0, totalBytesExpectedToSend);
+    }
+    NSTimeInterval teper = [NSDate timeIntervalSinceReferenceDate];
+    if (teper - z.posledneeOtpravki >= kProgressPauza) {
+        z.posledneeOtpravki = teper;
+        OtpravitProgress(z, @"progress", totalBytesSent, totalBytesExpectedToSend);
+    }
+}
+
+// --- Делегат: завершение ----------------------------------------------------
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    @autoreleasepool {
+        NSNumber *klyuch = @(task.taskIdentifier);
+        HTTP3Zadacha *z = nil;
+        NSString *imyaProtokola = nil;
+        @synchronized (self) {
+            z = self.zadachi[klyuch];
+            if (z) [self.zadachi removeObjectForKey:klyuch];
+            imyaProtokola = self.protokolZadachi[klyuch];
+            if (imyaProtokola) [self.protokolZadachi removeObjectForKey:klyuch];
+            if (z) [self.activeTasks removeObjectForKey:@(z.reqId)];
+        }
+        if (!z) return;
+
+        NSInteger statusCode = 0;
+
+        // Протокол берётся из метрики задачи, а не выдумывается. Если метрика
+        // не пришла, так и сообщаем — врать про HTTP/3 нельзя, на этом поле
+        // держится вся диагностика транспорта.
+        NSString *protocol;
+        if ([imyaProtokola hasPrefix:@"h3"]) {
+            protocol = [NSString stringWithFormat:@"HTTP/3 (QUIC / %@)", imyaProtokola];
+        } else if ([imyaProtokola hasPrefix:@"h2"]) {
+            protocol = [NSString stringWithFormat:@"HTTP/2.0 (%@)", imyaProtokola];
+        } else if (imyaProtokola.length > 0) {
+            protocol = [NSString stringWithFormat:@"HTTP (%@)", imyaProtokola];
+        } else {
+            protocol = @"HTTP (протокол не сообщён)";
+        }
+        NSString *transport = @"Native Apple Network.framework (NSURLSession)";
+        NSMutableDictionary *respHeaders = [NSMutableDictionary dictionary];
+
+        if ([task.response isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)task.response;
+            statusCode = httpResp.statusCode;
+            [respHeaders addEntriesFromDictionary:httpResp.allHeaderFields];
+        }
+
+        // ВЫСОКОПРОИЗВОДИТЕЛЬНЫЙ ПЕРЕНОС ДАННЫХ В LUA:
+        // Выделяем сырой C-буфер malloc() для передачи байтов в главный поток Lua.
+        // Это полностью предотвращает аккумуляцию объектов NSString/CFString в куче ARC.
+        void *responseBuf = NULL;
+        NSUInteger responseLen = 0;
+        NSData *data = z.telo;
+
+        if (data && data.length > 0) {
+            @synchronized (self) { self.totalBytesReceived += data.length; }
+            responseLen = data.length;
+            responseBuf = malloc(responseLen);
+            if (responseBuf) {
+                [data getBytes:responseBuf length:responseLen];
+            } else {
+                responseLen = 0;
+            }
+        }
+
+        // isError — ТОЛЬКО про сбой транспорта, как у network.request в
+        // Solar2D и как в версии для Windows. Код 4xx/5xx это нормально
+        // доставленный ответ: он приезжает в status, а разбирает его
+        // вызывающий.
+        BOOL isError = (error != nil);
+        NSString *errorDesc = error ? error.localizedDescription : nil;
+
+        @synchronized (self) {
+            if (isError) self.totalFailed++;
+            else self.totalCompleted++;
+        }
+
+        CoronaLuaRef listenerRef = z.listenerRef;
+        lua_State *mainLuaState = z.mainLuaState;
+        NSInteger reqId = z.reqId;
+        long long ozhidaetsya = z.ozhidaetsyaPriyoma;
+
+        // Перенос передачи результата в главный поток Corona Lua
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                if (listenerRef) {
+                    lua_State *currentL = SafeGetCoronaThread(mainLuaState);
+                    if (currentL) {
+                        SafeCoronaLuaNewEvent(currentL, "http3");
+
+                        lua_pushinteger(currentL, reqId);
+                        lua_setfield(currentL, -2, "requestId");
+
+                        lua_pushinteger(currentL, statusCode);
+                        lua_setfield(currentL, -2, "status");
+
+                        lua_pushboolean(currentL, isError);
+                        lua_setfield(currentL, -2, "isError");
+
+                        // Завершение — тоже фаза, и вызывающий отличает его от
+                        // промежуточных событий по ней, а не по наличию полей.
+                        lua_pushstring(currentL, "ended");
+                        lua_setfield(currentL, -2, "phase");
+
+                        if (errorDesc) {
+                            lua_pushstring(currentL, errorDesc.UTF8String);
+                            lua_setfield(currentL, -2, "error");
+                            lua_pushstring(currentL, errorDesc.UTF8String);
+                            lua_setfield(currentL, -2, "reason");
+                        } else {
+                            lua_pushnil(currentL);
+                            lua_setfield(currentL, -2, "error");
+                        }
+
+                        if (responseBuf && responseLen > 0) {
+                            lua_pushlstring(currentL, (const char *)responseBuf, responseLen);
+                            lua_setfield(currentL, -2, "response");
+                        } else {
+                            lua_pushstring(currentL, "");
+                            lua_setfield(currentL, -2, "response");
+                        }
+
+                        lua_pushinteger(currentL, responseLen);
+                        lua_setfield(currentL, -2, "bytesTotal");
+
+                        lua_pushnumber(currentL, (lua_Number)responseLen);
+                        lua_setfield(currentL, -2, "bytesTransferred");
+
+                        lua_pushnumber(currentL, (lua_Number)ozhidaetsya);
+                        lua_setfield(currentL, -2, "bytesEstimated");
+
+                        lua_pushstring(currentL, protocol.UTF8String);
+                        lua_setfield(currentL, -2, "protocol");
+
+                        lua_pushstring(currentL, transport.UTF8String);
+                        lua_setfield(currentL, -2, "transport");
+
+                        lua_pushboolean(currentL, YES);
+                        lua_setfield(currentL, -2, "isNative");
+
+                        lua_newtable(currentL);
+                        [respHeaders enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+                            lua_pushstring(currentL, [obj description].UTF8String);
+                            lua_setfield(currentL, -2, [key description].UTF8String);
+                        }];
+                        lua_setfield(currentL, -2, "headers");
+
+                        SafeCoronaLuaDispatchEvent(currentL, listenerRef);
+                        SafeCoronaLuaDeleteRef(currentL, listenerRef);
+                    }
+                }
+
+                // Очистка выделенного C-буфера строго после завершения взаимодействия с Lua
+                if (responseBuf) {
+                    free(responseBuf);
+                }
+            }
+        });
     }
 }
 
@@ -542,6 +723,28 @@ static int L_request(lua_State *L) {
         }
     }
 
+    // Просят ли события хода передачи. Отдельный флаг, а не всегда: события
+    // идут в очередь Lua-потока, и сыпать ими на каждый запрос игры незачем —
+    // их ждёт только выгрузка и скачивание файлов.
+    //
+    // ЗНАЧЕНИЕ БЫВАЕТ И СТРОКОЙ. В Solar2D params.progress принимает "upload"
+    // либо "download"; true понимается как «оба направления». Читается из той
+    // же таблицы параметров, что и timeout, при любой из трёх сигнатур.
+    BOOL progressOtpravki = NO;
+    BOOL progressPriyoma = NO;
+    if (tablicaIdx > 0) {
+        lua_getfield(L, tablicaIdx, "progress");
+        if (lua_isboolean(L, -1)) {
+            progressOtpravki = lua_toboolean(L, -1) ? YES : NO;
+            progressPriyoma = progressOtpravki;
+        } else if (lua_isstring(L, -1)) {
+            NSString *napravlenie = [NSString stringWithUTF8String:lua_tostring(L, -1)];
+            progressOtpravki = [napravlenie caseInsensitiveCompare:@"upload"] == NSOrderedSame;
+            progressPriyoma = [napravlenie caseInsensitiveCompare:@"download"] == NSOrderedSame;
+        }
+        lua_pop(L, 1);
+    }
+
     CoronaLuaRef listenerRef = NULL;
     if (lua_isfunction(L, listenerIdx) || lua_istable(L, listenerIdx)) {
         listenerRef = SafeCoronaLuaNewRef(L, listenerIdx);
@@ -569,6 +772,8 @@ static int L_request(lua_State *L) {
                                  headers:headers
                                     body:bodyData
                                  timeout:timeout
+                        progressOtpravki:progressOtpravki
+                         progressPriyoma:progressPriyoma
                                 luaState:L
                              listenerRef:listenerRef];
 

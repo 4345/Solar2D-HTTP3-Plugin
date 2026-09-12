@@ -343,9 +343,13 @@ end, { progress = true }, "avatar.jpg", system.DocumentsDirectory)
 
 События хода передачи (`began` / `progress` / `ended` с `bytesTransferred` и
 `bytesEstimated`) шлёт **нативный слой**, и есть они там, где доставка идёт
-push-коллбэком — сейчас это Android. `bytesEstimated = -1` означает «сервер не
-сообщил Content-Length» — ровно как в Solar2D; полосу в этом случае рисовать не
-по чему.
+push-коллбэком — Android и Apple (iOS, macOS). `bytesEstimated = -1` означает
+«сервер не сообщил Content-Length» — ровно как в Solar2D; полосу в этом случае
+рисовать не по чему.
+
+Направление задаётся значением `progress`: `true` — оба, `"download"` — только
+приём, `"upload"` — только отправка. Строку понимает и `network.request`
+Solar2D, поэтому существующий код переносится без правок.
 
 Опросный слой Windows промежуточных значений не имеет по устройству: он отдаёт
 только готовый результат. Чтобы вызывающий не гадал, есть функция:
