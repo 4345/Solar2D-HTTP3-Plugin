@@ -202,6 +202,39 @@ Apple/deployLocal.sh           # то же + выкладка в ~/Solar2DPlugin
 Правки в `shared/SimulatorPluginLibrary.mm`, сделанные на Windows, в архивы
 Apple НЕ попадают — их надо довезти этим скриптом с мака.
 
+### macOS: почему нативная часть называется `plugin_http3_native.dylib`
+
+Имя не произвольное. Lua ищет модуль сначала по `package.path` (`.lua`) и лишь
+потом по `package.cpath` (`.dylib`). В архиве лежит и обёртка
+`plugin_http3.lua`, и нативная часть; если назвать её `plugin_http3.dylib`, обе
+претендуют на модуль `plugin.http3` — выигрывает обёртка, а библиотека не
+грузится вообще. Обёртка же ищет нативную часть под именами `plugin.http3.ntv`
+и `plugin.http3.native` (себя саму она не ищет — это была бы рекурсия), не
+находит ничего и уходит в откат на `network.request`.
+
+Видно это не по ошибке, а по трафику: HTTP/3 нет, всё идёт по TCP. Поэтому
+dylib называется так же, как библиотека Windows, — по второму из искомых имён.
+
+### macOS: карантин Gatekeeper
+
+macOS метит скачанные файлы атрибутом `com.apple.quarantine`, и `tar` переносит
+метку с архива на всё, что из него распаковано. Gatekeeper затем отказывается
+грузить такой `.dylib`:
+
+```
+Apple не удалось подтвердить, что файл «plugin_http3_native.dylib»
+не содержит вредоносного ПО
+```
+
+Для плагина это снова выглядит не ошибкой, а молчаливым откатом на TCP. Снять
+метку:
+
+```bash
+xattr -dr com.apple.quarantine ~/Library/Application\ Support/Corona/Simulator/Plugins
+```
+
+`Apple/deployLocal.sh` делает это сам.
+
 **Чем собирать.** Нужен JDK 17 (проверено) — им же располагает и сама Solar2D:
 `<Solar2D>/Corona/jre`. На JDK 25 сборка падает ещё на конфигурации, с
 `IllegalArgumentException: 25.0.3` из `JavaVersion.parse`: компилятор Kotlin,
@@ -372,8 +405,8 @@ Solar2D-HTTP3-Plugin/
 │   ├── android/                    # plugin-release.aar и data.tgz для Android
 │   ├── iphone/                     # libplugin_http3_native.a и data.tgz для iOS устройств
 │   ├── iphone-sim/                 # libplugin_http3_native.a и data.tgz для iOS Симулятора
-│   ├── macOS/                      # plugin_http3.dylib и data.tgz для macOS Desktop
-│   ├── mac-sim/                    # plugin_http3.dylib и data.tgz для macOS Simulator
+│   ├── macOS/                      # plugin_http3_native.dylib и data.tgz для macOS Desktop
+│   ├── mac-sim/                    # plugin_http3_native.dylib и data.tgz для macOS Simulator
 │   ├── lua/                        # Резервный Lua-модуль и data.tgz
 │   └── metadata.lua                # Метаданные платформ Solar2D
 ├── lua/

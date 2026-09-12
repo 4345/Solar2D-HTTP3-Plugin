@@ -33,6 +33,18 @@ METADATA="$koren/plugins/metadata.lua"
 # его компоновщику как -lplugin_http3_native и ищет рядом lib<имя>.a.
 IMYA_LIB=plugin_http3_native
 
+# ИМЯ DYLIB ДЛЯ macOS — НЕ ПРОИЗВОЛЬНОЕ, и это не то же самое, что имя плагина.
+# Lua ищет модуль сначала по package.path (.lua), и лишь потом по package.cpath
+# (.dylib). В архиве лежит и обёртка plugin_http3.lua, и нативная часть; назови
+# её plugin_http3.dylib — обе претендуют на модуль plugin.http3, выигрывает
+# обёртка, а dylib не грузится ВООБЩЕ. Обёртка же ищет нативную часть под
+# именами plugin.http3.ntv и plugin.http3.native (себя саму она не ищет — это
+# была бы рекурсия), не находит ничего и уходит в откат на network.request.
+# Симптом: HTTP/3 нет, весь трафик идёт по TCP, и никакой ошибки при этом не
+# видно. Имя plugin_http3_native.dylib отвечает второму из искомых модулей и
+# совпадает с plugin_http3_native.dll на Windows.
+IMYA_DYLIB=plugin_http3_native.dylib
+
 # iOS 12 и macOS 10.14 — нижние границы из metadata.lua.
 IOS_MIN=12.0
 MAC_MIN=10.14
@@ -130,10 +142,18 @@ razlozhit() {
     echo " + $1"
 }
 
+# Сборка идёт под macOS, и всё, что она трогает, может унести на себе метку
+# com.apple.quarantine: у архива её подхватывает распакованный dylib, а
+# Gatekeeper отказывается такой грузить — плагин молча уходит в откат на TCP.
+# Снимаем сразу, чтобы метка не поехала дальше вместе с архивом.
+snyat_karantin() {
+    xattr -dr com.apple.quarantine "$@" 2>/dev/null || true
+}
+
 razlozhit iphone     "$TMP/lib$IMYA_LIB-ios.a"  "lib$IMYA_LIB.a"
 razlozhit iphone-sim "$TMP/lib$IMYA_LIB-sim.a"  "lib$IMYA_LIB.a"
-razlozhit macOS      "$TMP/plugin_http3.dylib"  "plugin_http3.dylib"
-razlozhit mac-sim    "$TMP/plugin_http3.dylib"  "plugin_http3.dylib"
+razlozhit macOS      "$TMP/plugin_http3.dylib"  "$IMYA_DYLIB"
+razlozhit mac-sim    "$TMP/plugin_http3.dylib"  "$IMYA_DYLIB"
 
 # --- Проверка ----------------------------------------------------------------
 # Собранного мало: нужно, чтобы в библиотеке были точки входа, под которыми
@@ -151,8 +171,17 @@ for p in iphone iphone-sim; do
     echo "[$p] $(lipo -info "$lib" | sed 's/.*: //')"
 done
 for p in macOS mac-sim; do
-    echo "[$p] $(lipo -info "$koren/plugins/$p/plugin_http3.dylib" | sed 's/.*: //')"
+    dylib="$koren/plugins/$p/$IMYA_DYLIB"
+    # Та же проверка, что и для iOS: собранного мало, нужны точки входа.
+    for simvol in _luaopen_plugin_http3_ntv _luaopen_plugin_http3_native; do
+        if ! nm -g "$dylib" 2>/dev/null | grep -q " T $simvol$"; then
+            echo "[$p] НЕТ символа $simvol" >&2
+            oshibok=$((oshibok + 1))
+        fi
+    done
+    echo "[$p] $(lipo -info "$dylib" | sed 's/.*: //')"
 done
+snyat_karantin "$koren/plugins"
 pokazat_sostav
 [ "$oshibok" -eq 0 ] || { echo "Сборка неполная: символов не хватает"; exit 1; }
 echo "Готово."

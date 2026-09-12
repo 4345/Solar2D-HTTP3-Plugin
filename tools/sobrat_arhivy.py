@@ -52,8 +52,11 @@ PLATFORMY = ("win32", "win32-sim", "android", "lua")
 APPLE_SOSTAV = {
     "iphone": "libplugin_http3_native.a",
     "iphone-sim": "libplugin_http3_native.a",
-    "macOS": "plugin_http3.dylib",
-    "mac-sim": "plugin_http3.dylib",
+    # Не plugin_http3.dylib: это имя сталкивается с обёрткой plugin_http3.lua
+    # за модуль plugin.http3, обёртка выигрывает, и нативная часть не грузится
+    # вовсе — см. комментарий в Apple/build.sh.
+    "macOS": "plugin_http3_native.dylib",
+    "mac-sim": "plugin_http3_native.dylib",
 }
 
 KRASNYY, ZELENYY, ZHELTYY, SBROS = "\033[31m", "\033[32m", "\033[33m", "\033[0m"
