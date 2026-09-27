@@ -434,6 +434,7 @@ Solar2D-HTTP3-Plugin/
 │   ├── build.settings              # Пример конфигурации
 │   └── config.lua
 ├── .gitignore                      # Исключение временных файлов сборки
+├── LICENSE                         # Лицензия MIT
 └── ReadMe.md                       # Главная документация проекта
 ```
 
@@ -448,3 +449,25 @@ Solar2D-HTTP3-Plugin/
    - **Пачка 50 REQ**: стресс-тест 50 параллельных сетевых подключений.
    - **Очистить GC**: принудительный сбор мусора.
    - **Тест Cancel**: проверка отмены сетевой задачи.
+
+---
+
+## 📄 Лицензия
+
+Плагин распространяется по лицензии **MIT** — см. файл [`LICENSE`](LICENSE). Его
+можно свободно использовать, изменять и распространять, в том числе в
+коммерческих приложениях, сохраняя уведомление об авторских правах.
+
+В репозитории лежат заголовочные файлы сторонних проектов — все под MIT и со
+своими уведомлениями, которые остаются в силе:
+
+| Файлы | Проект | Лицензия |
+| :--- | :--- | :--- |
+| `msquic.h`, `msquic_winuser.h` (в `shared/`, `Apple/shared/`, `win32/include_fake/`); `win32/include_fake/msquic_min.h` — сокращённые объявления по их образцу | [MsQuic](https://github.com/microsoft/msquic) (Microsoft) | MIT |
+| заголовки Corona: `Apple/shared/include/Corona/`, `win32/include_fake/Corona/` | [Solar2D](https://github.com/coronalabs/corona) | MIT |
+| заголовки Lua 5.1: `Apple/shared/include/lua/`, `win32/include_fake/lua/` | [Lua](https://www.lua.org) (Lua.org, PUC-Rio) | MIT |
+
+Остальные файлы `win32/include_fake/` (`windows.h`, `winhttp.h`, `stdio.h` и
+другие) — собственные минимальные заглушки проекта для сборки без Windows SDK,
+а не копии заголовков SDK; они под лицензией плагина.
+
