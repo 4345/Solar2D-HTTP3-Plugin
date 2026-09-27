@@ -139,7 +139,11 @@ static int MyAtoi(const char* s) {
 //
 // Стандартной библиотеки здесь нет (см. шапку файла), поэтому число в строку
 // переводим сами.
+// Стенд включает журнал ключом сборки (build_stend.bat /DHTTP3_LOG_ENABLED=1),
+// не правя исходник.
+#ifndef HTTP3_LOG_ENABLED
 #define HTTP3_LOG_ENABLED 0   // 0 — собрать без журнала (боевая сборка)
+#endif
 
 #if HTTP3_LOG_ENABLED
 static void LogPutNum(unsigned long v, char* out, int* pos, int cap) {
@@ -535,6 +539,9 @@ typedef struct AsyncRequestContext {
     // запрос, которому вызывающий разрешил больше, чем зашито, обрывался раньше
     // срока и выглядел как отказ транспорта - хотя ни сеть, ни сервер ни при чём.
     int timeout_ms;
+    // Когда запрос создан (GetTickCount). Срок запроса общий на оба пути гонки:
+    // запасной TCP стартует через окно и получает ОСТАТОК, а не полный срок.
+    unsigned long nachalo;
     // Просил ли вызывающий события хода передачи. Отдельный флаг, а не всегда:
     // слотов прогресса конечное число, и занимать их под каждый запрос
     // приложения незачем — счётчики ждёт только выгрузка и скачивание файлов.
@@ -555,6 +562,18 @@ typedef struct RaceContext {
     volatile long quicProgress;   // 1 если QUIC успешно прошёл handshake/connected
     volatile long tcpFinished;    // 0 = in-flight, 1 = success, 2 = failed
     volatile long tcpSuccess;     // 1 if TCP succeeded, 0 if failed
+    // КТО ОТПРАВЛЯЕТ ЗАПРОС: 0 = никто, 1 = QUIC, 2 = TCP, 3 = запрос закрыт
+    // без отправки (QUIC сдался раньше, чем кто-либо отправил).
+    //
+    // Гонка идёт за СОЕДИНЕНИЕ, но отправить запрос вправе ровно один путь.
+    // Раньше каждый путь отправлял его сам, как только мог: QUIC — после
+    // рукопожатия, TCP — сразу после старта. Если QUIC не успевал соединиться за
+    // окно, но соединялся чуть позже старта TCP, запрос доходил до сервера
+    // ДВАЖДЫ, а вызывающий видел один ответ (победителя). Для GET это лишний
+    // трафик, для POST — повторное действие: одно и то же сообщение приходило
+    // адресату два раза. Право берётся атомарно прямо перед отправкой; тот, кто
+    // опоздал, запрос не шлёт и уступает (RACE_SKIPPED), а не сообщает сбой.
+    volatile long otpravitel;
     volatile long refCount;       // Счетчик ссылок потоков на контекст гонки для атомарного освобождения памяти
 
     HANDLE quicDoneEvent;
@@ -1100,6 +1119,9 @@ typedef struct Http3State {
 
     volatile long success;
     volatile long failed;
+    // QUIC уступил отправку: запрос уже отправлен (или отправляется) по TCP,
+    // см. RaceContext::otpravitel. Это не сбой — результат опубликует TCP.
+    volatile long ustupil;
     volatile long shutdownComplete;
     HANDLE shutdownEvent;
     int status;
@@ -1228,6 +1250,14 @@ static void ZapomnitRukopozhatie(const char* host, unsigned long ms) {
 }
 
 static unsigned long OknoSoedineniya(const char* host) {
+#ifdef HTTP3_PROBA_OKNO_MS
+    // ТОЛЬКО ДЛЯ СТЕНДА ГОНКИ (test_app/proba_odnogo_otpravitelya.lua): окно
+    // задаётся при сборке, чтобы TCP стартовал, пока QUIC ещё рукопожимается, —
+    // ровно тот случай, в котором запрос прежде уходил обоими путями. В обычной
+    // сборке ключа нет.
+    (void)host;
+    return HTTP3_PROBA_OKNO_MS;
+#endif
     if (!host || !host[0]) return OKNO_SOED_MAX_MS;
     ZameryInitOnce();
     unsigned long okno = OKNO_SOED_MAX_MS;
@@ -1381,6 +1411,18 @@ static void Http3OtpravitZapros(Http3Conn* c, Http3State* state, int tyoploe) {
     QUIC_API_TABLE* api = c->api;
     AsyncRequestContext* req = state->req;
     void* heap = GetProcessHeap();
+
+    // ПРАВО ОТПРАВИТЬ — одно на запрос (см. RaceContext::otpravitel). TCP уже
+    // отправляет — уступаем: соединение исправно и вернётся в пул, а результат
+    // опубликует TCP.
+    if (state->race && !__sync_bool_compare_and_swap(&state->race->otpravitel, 0, 1)) {
+        LogHexVal("Http3OtpravitZapros: запрос уже отправляет другой путь, QUIC уступает; отправитель",
+                  (unsigned long)state->race->otpravitel);
+        state->ustupil = 1;
+        __sync_bool_compare_and_swap(&state->failed, 0, 1);
+        if (state->doneEvent) SetEvent(state->doneEvent);
+        return;
+    }
 
     char* authority = (char*)HeapAlloc(heap, 0, 300);
     if (state->port == 443) MyStrCopy(authority, 300, state->host);
@@ -1716,7 +1758,46 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     if (!state->success) outcome = RACE_FAILURE;
     else outcome = RACE_SUCCESS;
 
-    if (outcome == RACE_SUCCESS) {
+    // QUIC НЕ ОТПРАВЛЯЛ ЗАПРОС — сбоем запроса его неудача не является. Два
+    // случая:
+    //  * запрос отправляет TCP (уступили при соединении либо TCP взял право,
+    //    пока QUIC ещё рукопожимался) — молча уступаем, результат за TCP.
+    //    Раньше QUIC, упавший на рукопожатии, публиковал ошибку раньше TCP:
+    //    Lua-обёртка по ней повторяла запрос через network.request, а ответ
+    //    TCP выбрасывался — запрос доходил до сервера дважды;
+    //  * никто ещё не отправлял — закрываем право (3), чтобы TCP, стартующий в
+    //    эту же миллисекунду, не отправил запрос вслед за опубликованной
+    //    ошибкой, и сообщаем сбой как раньше.
+    if (outcome == RACE_FAILURE && race && race->otpravitel != 1) {
+        if (state->ustupil || !__sync_bool_compare_and_swap(&race->otpravitel, 0, 3)) {
+            LogMsg("Http3ThreadFunc: запрос отправляет TCP — QUIC уступает (это не сбой)");
+            outcome = RACE_SKIPPED;
+            race->quicFinished = 2;
+            if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
+            RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
+
+            // СРОК ЗАПРОСА ДЕРЖИМ ЗДЕСЬ, а не у WinHTTP. Своему таймауту на
+            // соединение WinHTTP не следует: к молчащему адресу
+            // WinHttpSendRequest с таймаутом 250 мс не вернулся и через 2 с
+            // (замер стендом proba_taymauta). Прежде это прятал QUIC — он
+            // публиковал отказ по своему сроку, а ответ TCP выбрасывался. Теперь
+            // результат за TCP, поэтому ждём его до срока запроса (с запасом на
+            // ответ, пришедший на самой границе) и, не дождавшись, сообщаем
+            // отказ по сроку. Запоздавший ответ TCP отбросит CAS в AddResult.
+            DWORD srok = (DWORD)req->timeout_ms + 250;
+            while (race->winnerAssigned == 0 && (GetTickCount() - req->nachalo) < srok) {
+                Sleep(50);
+            }
+            if (race->winnerAssigned == 0) {
+                LogMsg("Http3ThreadFunc: TCP не уложился в срок запроса — отказ по сроку");
+                RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "Request timeout");
+            }
+        }
+    }
+
+    if (outcome == RACE_SKIPPED) {
+        // результат опубликует TCP
+    } else if (outcome == RACE_SUCCESS) {
         LogMsg("Http3ThreadFunc: успешный ответ по MsQuic/HTTP3 (QUIC победил по Happy Eyeballs v3)");
         RaceFinish(race, RACE_SUCCESS, state->status, (const char*)state->respBody, state->respBodyLen, "MsQuic/HTTP3", NULL);
     } else {
@@ -1887,8 +1968,18 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
     // запроса ставим на его собственный дескриптор. Иначе запасной TCP-путь
     // продолжал бы жить по зашитой константе и обрывал бы долгие запросы,
     // которым вызывающий разрешил больше.
-    WinHttpSetTimeouts(hRequest, req->timeout_ms, req->timeout_ms,
-                       req->timeout_ms, req->timeout_ms);
+    //
+    // И не ПОЛНЫЙ срок, а ОСТАТОК: TCP стартует через окно гонки, а срок у
+    // запроса один. Пока QUIC мог опубликовать отказ по своему таймауту, это
+    // было незаметно, — но теперь, если запрос отправляет TCP, ответ ждут от
+    // него (см. RaceContext::otpravitel), и полный срок растягивал бы отказ на
+    // величину окна и дальше (замер: срок 1 с — отказ через 3 с).
+    {
+        unsigned long proshlo = GetTickCount() - req->nachalo;
+        int ostalos = req->timeout_ms - (int)proshlo;
+        if (ostalos < 250) ostalos = 250;   // WinHTTP нужно хоть сколько-то на попытку
+        WinHttpSetTimeouts(hRequest, ostalos, ostalos, ostalos, ostalos);
+    }
 
     // Буфер под широкие символы — по фактической длине заголовков. Раньше
     // было 1024, и набор длиннее обрезался здесь, даже если выше уцелел.
@@ -1907,6 +1998,21 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
 
     if (race->winnerAssigned) {
         LogMsg("Http1ThreadFunc: MsQuic/HTTP3 победил перед отправкой запроса, прерываем");
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
+        ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
+        HeapFree(GetProcessHeap(), 0, w_headers);
+        return 0;
+    }
+
+    // ПРАВО ОТПРАВИТЬ — одно на запрос (см. RaceContext::otpravitel). QUIC уже
+    // соединился и отправил (1) либо запрос закрыт без отправки (3) — второй
+    // раз запрос не шлём.
+    if (!__sync_bool_compare_and_swap(&race->otpravitel, 0, 2)) {
+        LogHexVal("Http1ThreadFunc: запрос уже отправляет другой путь, TCP уступает; отправитель",
+                  (unsigned long)race->otpravitel);
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         RaceFinish(race, RACE_SKIPPED, 0, NULL, 0, NULL, NULL);
@@ -2165,6 +2271,7 @@ static int initiateRequest( lua_State *L )
     req->body_len = 0;
     // req->headers остаётся NULL, пока заголовки не разобраны: структура обнулена выше.
     req->timeout_ms = HTTP3_REQUEST_TIMEOUT_MS;   // умолчание, ниже перекроется параметром
+    req->nachalo = GetTickCount();
     req->id = g_NextRequestId++;
 
     if (lua_isstring(L, 2)) {
