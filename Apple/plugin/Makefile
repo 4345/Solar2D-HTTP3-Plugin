@@ -16,7 +16,7 @@ UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
     TARGET = http3.dylib
-    LDFLAGS = -dynamiclib -undefined dynamic_lookup -framework Foundation -framework Network -mmacosx-version-min=10.14
+    LDFLAGS = -dynamiclib -undefined dynamic_lookup -framework Foundation -framework Network -framework Security -mmacosx-version-min=10.14
 else
     TARGET = http3.so
     LDFLAGS = -shared

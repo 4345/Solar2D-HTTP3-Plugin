@@ -18,7 +18,7 @@ return {
 
         -- Читает сборщик iOS/tvOS.
         staticLibs = { 'plugin_http3_native' },
-        frameworks = { "Foundation", "Network" },
+        frameworks = { "Foundation", "Network", "Security" },
         frameworksOptional = {},
 
         -- Прежнее имя ключа. Оставлено: его понимают сторонние скрипты
@@ -26,15 +26,15 @@ return {
         staticLibraryName = 'plugin_http3_native',
 
         iphoneos = {
-            frameworks = { "Foundation", "Network" },
+            frameworks = { "Foundation", "Network", "Security" },
             minOSVersion = "12.0",
         },
         iphonesimulator = {
-            frameworks = { "Foundation", "Network" },
+            frameworks = { "Foundation", "Network", "Security" },
             minOSVersion = "12.0",
         },
         macosx = {
-            frameworks = { "Foundation", "Network" },
+            frameworks = { "Foundation", "Network", "Security" },
             minOSVersion = "10.14",
         },
         win32 = {

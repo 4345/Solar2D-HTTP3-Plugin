@@ -113,7 +113,7 @@ xcrun lipo -create "$TMP/sim_arm64.a" "$TMP/sim_x86_64.a" -output "$TMP/lib$IMYA
 echo " * macosx arm64 x86_64"
 xcrun --sdk macosx clang -dynamiclib "$ISHODNIK" -o "$TMP/plugin_http3.dylib" \
     -arch arm64 -arch x86_64 -mmacosx-version-min="$MAC_MIN" \
-    -undefined dynamic_lookup -framework Foundation -framework Network \
+    -undefined dynamic_lookup -framework Foundation -framework Network -framework Security \
     "${FLAGI[@]}" "${VKLYUCHENIYA[@]}"
 
 # --- Раскладка и архивы ------------------------------------------------------

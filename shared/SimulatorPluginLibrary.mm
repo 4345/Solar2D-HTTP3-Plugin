@@ -9,11 +9,14 @@
 
 #import <Foundation/Foundation.h>
 #import <Network/Network.h>
+#import <Security/Security.h>
 #import <mach/mach.h>
 #import <objc/runtime.h>
+#include <time.h>
 
 #include "CoronaLua.h"
 #include "CoronaMacros.h"
+#include "piny.h"
 
 // Объявления внешних функций взаимодействия с рантаймом Corona/Solar2D
 extern lua_State *CoronaLuaGetCoronaThread(lua_State *coroutine) __attribute__((weak));
@@ -114,7 +117,66 @@ static const NSTimeInterval kProgressPauza = 0.5;
 // тоже независимы — там счётчик отправки живёт в самом UploadDataProvider.
 @property (nonatomic, assign) NSTimeInterval posledneePriyoma;
 @property (nonatomic, assign) NSTimeInterval posledneeOtpravki;
+// Сервер не прошёл привязку ключей (http3.setPins): завершение уходит в Lua
+// с reason = "PIN_FAILED", а не с текстом отмены.
+@property (nonatomic, assign) BOOL pinOtkaz;
 @end
+
+// --- Привязка ключей (http3.setPins, shared/piny.h) -------------------------
+// ТОЛЬКО по вызову приложения: пока набор не задан, делегат проверки
+// сертификата отвечает системе «обработай как обычно» — ровно то, что она
+// делает и без делегата. С набором: для хоста из списка цепочка сначала
+// проверяется системой (SecTrustEvaluateWithError), затем в ней ищется ключ
+// из набора; нет — соединение отвергается ещё до отправки запроса.
+static PinyNabor g_Piny;
+static BOOL g_PinyEst = NO;
+
+static NSObject *PinyZamok(void) {
+    static NSObject *zamok = nil;
+    static dispatch_once_t odin;
+    dispatch_once(&odin, ^{ zamok = [[NSObject alloc] init]; });
+    return zamok;
+}
+
+// Хост под привязкой; nabor — снимок набора для проверки.
+static int PinyDlyaHosta(const char *host, PinyNabor *nabor) {
+    if (!g_PinyEst || !host) return 0;
+    @synchronized (PinyZamok()) { *nabor = g_Piny; }
+    return piny_host_pod_privyazkoy(nabor, host, (double)time(NULL));
+}
+
+// Проверенная системой цепочка содержит ключ из набора.
+static BOOL PinyVCepochke(const PinyNabor *nabor, SecTrustRef trust) {
+    if (!trust || !SecTrustEvaluateWithError(trust, NULL)) return NO;
+    BOOL ok = NO;
+    if (@available(iOS 15.0, macOS 12.0, *)) {
+        CFArrayRef cep = SecTrustCopyCertificateChain(trust);
+        if (cep) {
+            for (CFIndex i = 0; i < CFArrayGetCount(cep) && !ok; i++) {
+                CFDataRef d = SecCertificateCopyData((SecCertificateRef)CFArrayGetValueAtIndex(cep, i));
+                if (d) {
+                    ok = piny_klyuch_v_nabore(nabor, CFDataGetBytePtr(d), (size_t)CFDataGetLength(d));
+                    CFRelease(d);
+                }
+            }
+            CFRelease(cep);
+        }
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CFIndex n = SecTrustGetCertificateCount(trust);
+        for (CFIndex i = 0; i < n && !ok; i++) {
+            SecCertificateRef c = SecTrustGetCertificateAtIndex(trust, i);
+            CFDataRef d = c ? SecCertificateCopyData(c) : NULL;
+            if (d) {
+                ok = piny_klyuch_v_nabore(nabor, CFDataGetBytePtr(d), (size_t)CFDataGetLength(d));
+                CFRelease(d);
+            }
+        }
+#pragma clang diagnostic pop
+    }
+    return ok;
+}
 
 @implementation HTTP3Zadacha
 - (instancetype)init {
@@ -137,10 +199,10 @@ static const NSTimeInterval kProgressPauza = 0.5;
 // Согласованный протокол по идентификатору задачи. Заполняется в
 // URLSession:task:didFinishCollectingMetrics: — единственном месте, где
 // NSURLSession сообщает, ЧТО он на самом деле использовал.
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *protokolZadachi;
-// Контексты задач по taskIdentifier: делегат получает только задачу, а ему
-// нужны и слушатель, и накопленное тело, и флаги прогресса.
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, HTTP3Zadacha *> *zadachi;
+@property (nonatomic, strong) NSMutableDictionary<NSValue *, NSString *> *protokolZadachi;
+// Контексты задач по объекту задачи (KlyuchZadachi): делегат получает только
+// задачу, а ему нужны и слушатель, и накопленное тело, и флаги прогресса.
+@property (nonatomic, strong) NSMutableDictionary<NSValue *, HTTP3Zadacha *> *zadachi;
 @property (nonatomic, assign) NSInteger nextRequestId;
 @property (nonatomic, assign) int64_t totalCompleted;
 @property (nonatomic, assign) int64_t totalFailed;
@@ -148,6 +210,7 @@ static const NSTimeInterval kProgressPauza = 0.5;
 @property (nonatomic, assign) BOOL isHTTP3Configured;
 
 + (instancetype)sharedInstance;
+- (void)smenitSessiyu;
 
 - (NSInteger)requestWithURL:(NSString *)urlStr
                      method:(NSString *)method
@@ -164,6 +227,15 @@ static const NSTimeInterval kProgressPauza = 0.5;
 - (void)pumpRunLoop:(double)seconds;
 
 @end
+
+// Ключ задачи в словарях менеджера — адрес объекта задачи. Не taskIdentifier:
+// номера задач уникальны лишь в пределах сессии, а при смене набора привязки
+// ключей сессия пересоздаётся (smenitSessiyu), и задачи старой ещё
+// завершаются. Задача живёт в activeTasks до завершения — адрес не
+// переиспользуется, пока ключ в словаре.
+static inline NSValue *KlyuchZadachi(NSURLSessionTask *task) {
+    return [NSValue valueWithPointer:(__bridge const void *)task];
+}
 
 @implementation HTTP3PluginManager
 
@@ -188,36 +260,6 @@ static const NSTimeInterval kProgressPauza = 0.5;
         _totalBytesReceived = 0;
         _isHTTP3Configured = NO;
 
-        // Настройка сессии NSURLSession
-        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-        config.HTTPMaximumConnectionsPerHost = 64;
-        // Сколько ждать ОЧЕРЕДНЫХ данных. Значение перекрывается на каждом
-        // запросе из params.timeout (см. requestWithURL ниже), здесь оно
-        // остаётся только запасным.
-        config.timeoutIntervalForRequest = 30.0;
-
-        // Потолок на ВСЮ передачу. Здесь стояли 60 секунд, и это был предел на
-        // размер передаваемого: всё, что не укладывалось в минуту, обрывалось
-        // на середине с «The request timed out» — независимо от того, сколько
-        // просил вызывающий и шли ли данные ровно, без единого простоя.
-        // Замер: запрос с timeout = 300 к источнику, отдающему ровно 90 секунд,
-        // обрывался на 60-й, приняв 491 520 байт из 737 280.
-        //
-        // Задать его на отдельный запрос нельзя — свойство сессии, и сессия
-        // одна на все запросы. Поэтому потолка здесь нет вовсе (7 суток —
-        // значение Apple по умолчанию), а от зависшей передачи защищает
-        // timeoutIntervalForRequest: он считает простой, а не общее время.
-        // Так же ведут себя и остальные платформы: на Android запрос отменяет
-        // таймер по timeout вызывающего, на Windows по нему же идёт ожидание,
-        // и ни там, ни там скрытой минуты нет.
-        config.timeoutIntervalForResource = 604800.0;
-
-        // Отключение локального кэша и куки для изоляции сетевого слоя
-        config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-        config.URLCache = nil;
-        config.URLCredentialStorage = nil;
-        config.HTTPCookieStorage = nil;
-
         // Свойство assumesHTTP3Capable принадлежит ЗАПРОСУ, а не конфигурации
         // сессии. Здесь стояла попытка выставить его на конфигурации по строке
         // через KVC: проверка respondsToSelector не проходила, блок не
@@ -229,9 +271,60 @@ static const NSTimeInterval kProgressPauza = 0.5;
             _isHTTP3Configured = YES;
         }
 
-        _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+        _session = [self novayaSessiya];
     }
     return self;
+}
+
+// Сессия с настройками плагина. Своя функция — потому что сессий за жизнь
+// процесса бывает больше одной: смена набора привязки ключей её пересоздаёт.
+- (NSURLSession *)novayaSessiya {
+    // Настройка сессии NSURLSession
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.HTTPMaximumConnectionsPerHost = 64;
+    // Сколько ждать ОЧЕРЕДНЫХ данных. Значение перекрывается на каждом
+    // запросе из params.timeout (см. requestWithURL ниже), здесь оно
+    // остаётся только запасным.
+    config.timeoutIntervalForRequest = 30.0;
+
+    // Потолок на ВСЮ передачу. Здесь стояли 60 секунд, и это был предел на
+    // размер передаваемого: всё, что не укладывалось в минуту, обрывалось
+    // на середине с «The request timed out» — независимо от того, сколько
+    // просил вызывающий и шли ли данные ровно, без единого простоя.
+    // Замер: запрос с timeout = 300 к источнику, отдающему ровно 90 секунд,
+    // обрывался на 60-й, приняв 491 520 байт из 737 280.
+    //
+    // Задать его на отдельный запрос нельзя — свойство сессии, и сессия
+    // одна на все запросы. Поэтому потолка здесь нет вовсе (7 суток —
+    // значение Apple по умолчанию), а от зависшей передачи защищает
+    // timeoutIntervalForRequest: он считает простой, а не общее время.
+    // Так же ведут себя и остальные платформы: на Android запрос отменяет
+    // таймер по timeout вызывающего, на Windows по нему же идёт ожидание,
+    // и ни там, ни там скрытой минуты нет.
+    config.timeoutIntervalForResource = 604800.0;
+
+    // Отключение локального кэша и куки для изоляции сетевого слоя
+    config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    config.URLCache = nil;
+    config.URLCredentialStorage = nil;
+    config.HTTPCookieStorage = nil;
+
+    return [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+}
+
+// Новый набор привязки — новая сессия. Прежняя держит свои соединения и
+// возобновляемые сеансы TLS, по которым сертификат больше не предъявляется и
+// делегат проверки не зовётся: проверено на macOS — после flush и reset
+// запрос с новым, чужим, набором проходил по старому соединению HTTP/3.
+// Задачи прежней сессии доживают своё (finishTasksAndInvalidate).
+- (void)smenitSessiyu {
+    NSURLSession *prezhnyaya = nil;
+    NSURLSession *novaya = [self novayaSessiya];
+    @synchronized (self) {
+        prezhnyaya = _session;
+        _session = novaya;
+    }
+    [prezhnyaya finishTasksAndInvalidate];
 }
 
 // Метрики задачи: отсюда берётся ИМЯ СОГЛАСОВАННОГО ПРОТОКОЛА. Раньше плагин
@@ -247,7 +340,7 @@ didFinishCollectingMetrics:(NSURLSessionTaskMetrics *)metrics {
     NSString *imya = metrics.transactionMetrics.lastObject.networkProtocolName;
     if (imya.length > 0) {
         @synchronized (self) {
-            self.protokolZadachi[@(task.taskIdentifier)] = imya;
+            self.protokolZadachi[KlyuchZadachi(task)] = imya;
         }
     }
 }
@@ -360,7 +453,9 @@ static void OtpravitProgress(HTTP3Zadacha *z, NSString *faza,
 
         // Задача БЕЗ обработчика-блока: с ним NSURLSession не зовёт
         // didReceiveData, и промежуточных событий приёма не будет вовсе.
-        NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request];
+        NSURLSession *sessiya = nil;
+        @synchronized (self) { sessiya = self.session; }
+        NSURLSessionDataTask *task = [sessiya dataTaskWithRequest:request];
 
         HTTP3Zadacha *z = [[HTTP3Zadacha alloc] init];
         z.reqId = reqId;
@@ -371,7 +466,7 @@ static void OtpravitProgress(HTTP3Zadacha *z, NSString *faza,
 
         @synchronized (self) {
             self.activeTasks[reqIdNum] = task;
-            self.zadachi[@(task.taskIdentifier)] = z;
+            self.zadachi[KlyuchZadachi(task)] = z;
         }
 
         [task resume];
@@ -386,7 +481,7 @@ static void OtpravitProgress(HTTP3Zadacha *z, NSString *faza,
 didReceiveResponse:(NSURLResponse *)response
  completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
     HTTP3Zadacha *z = nil;
-    @synchronized (self) { z = self.zadachi[@(dataTask.taskIdentifier)]; }
+    @synchronized (self) { z = self.zadachi[KlyuchZadachi(dataTask)]; }
     if (z) {
         // expectedContentLength сам отдаёт -1 (NSURLResponseUnknownLength),
         // когда Content-Length в ответе нет, — то же значение, что и у
@@ -407,7 +502,7 @@ didReceiveResponse:(NSURLResponse *)response
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
     HTTP3Zadacha *z = nil;
-    @synchronized (self) { z = self.zadachi[@(dataTask.taskIdentifier)]; }
+    @synchronized (self) { z = self.zadachi[KlyuchZadachi(dataTask)]; }
     if (!z) return;
 
     [z.telo appendData:data];
@@ -435,7 +530,7 @@ didReceiveResponse:(NSURLResponse *)response
     totalBytesSent:(int64_t)totalBytesSent
 totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     HTTP3Zadacha *z = nil;
-    @synchronized (self) { z = self.zadachi[@(task.taskIdentifier)]; }
+    @synchronized (self) { z = self.zadachi[KlyuchZadachi(task)]; }
     if (!z || !z.progressOtpravki) return;
 
     if (!z.nachaloOtpravki) {
@@ -449,13 +544,40 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     }
 }
 
+// --- Делегат: проверка сертификата (привязка ключей) -----------------------
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
+    NSURLProtectionSpace *prostranstvo = challenge.protectionSpace;
+    PinyNabor nabor;
+    if (![prostranstvo.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]
+        || !PinyDlyaHosta(prostranstvo.host.UTF8String, &nabor)) {
+        // Без набора (или не этот хост) — как без делегата.
+        completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+        return;
+    }
+    SecTrustRef trust = prostranstvo.serverTrust;
+    if (PinyVCepochke(&nabor, trust)) {
+        completionHandler(NSURLSessionAuthChallengeUseCredential, [NSURLCredential credentialForTrust:trust]);
+        return;
+    }
+    NSLog(@"[HTTP3] %@: ключ сервера не из набора привязки — соединение отвергнуто", prostranstvo.host);
+    @synchronized (self) {
+        HTTP3Zadacha *z = self.zadachi[KlyuchZadachi(task)];
+        if (z) z.pinOtkaz = YES;
+    }
+    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+}
+
 // --- Делегат: завершение ----------------------------------------------------
 
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
     @autoreleasepool {
-        NSNumber *klyuch = @(task.taskIdentifier);
+        NSValue *klyuch = KlyuchZadachi(task);
         HTTP3Zadacha *z = nil;
         NSString *imyaProtokola = nil;
         @synchronized (self) {
@@ -515,6 +637,12 @@ didCompleteWithError:(NSError *)error {
         // вызывающий.
         BOOL isError = (error != nil);
         NSString *errorDesc = error ? error.localizedDescription : nil;
+        // Отказ привязки — своя причина: не сбой сети и не отмена вызывающим.
+        BOOL pinOtkaz = z.pinOtkaz;
+        if (pinOtkaz) {
+            isError = YES;
+            errorDesc = @"Ключ сервера не из набора привязки";
+        }
 
         @synchronized (self) {
             if (isError) self.totalFailed++;
@@ -551,7 +679,7 @@ didCompleteWithError:(NSError *)error {
                         if (errorDesc) {
                             lua_pushstring(currentL, errorDesc.UTF8String);
                             lua_setfield(currentL, -2, "error");
-                            lua_pushstring(currentL, errorDesc.UTF8String);
+                            lua_pushstring(currentL, pinOtkaz ? "PIN_FAILED" : errorDesc.UTF8String);
                             lua_setfield(currentL, -2, "reason");
                         } else {
                             lua_pushnil(currentL);
@@ -870,6 +998,52 @@ static int L_pumpEvents(lua_State *L) {
     return 0;
 }
 
+// setPins(hosts, pins, expires) -> true | false, причина. Набор привязки
+// ключей (см. g_Piny): hosts — имена поимённо, pins — "sha256/<base64>"
+// SubjectPublicKeyInfo, expires — Unix-время конца срока. Пустые hosts —
+// привязка снята. Соединения, поднятые при прежнем наборе, сбрасываются:
+// проверка идёт при установлении соединения.
+static int L_setPins(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    PinyNabor n;
+    memset(&n, 0, sizeof(n));
+    n.do_sekund = luaL_checknumber(L, 3);
+    const char *oshibka = NULL;
+    int hostov = (int)lua_objlen(L, 1);
+    for (int i = 1; i <= hostov && !oshibka; i++) {
+        lua_rawgeti(L, 1, i);
+        const char *h = lua_tostring(L, -1);
+        if (!h || !h[0] || strlen(h) >= PINY_DLINA_HOSTA) oshibka = "неверный хост";
+        else if (n.hostov >= PINY_HOSTOV) oshibka = "слишком много хостов";
+        else strlcpy(n.hosty[n.hostov++], h, PINY_DLINA_HOSTA);
+        lua_pop(L, 1);
+    }
+    int klyuchey = (int)lua_objlen(L, 2);
+    for (int i = 1; i <= klyuchey && !oshibka; i++) {
+        lua_rawgeti(L, 2, i);
+        const char *k = lua_tostring(L, -1);
+        if (n.klyuchey >= PINY_KLYUCHEY) oshibka = "слишком много отпечатков";
+        else if (!piny_otpechatok(k, n.klyuchi[n.klyuchey])) oshibka = "неверный отпечаток (нужен sha256/<base64> 32 байт)";
+        else n.klyuchey++;
+        lua_pop(L, 1);
+    }
+    if (!oshibka && n.hostov > 0 && n.klyuchey == 0) oshibka = "нет отпечатков";
+    if (oshibka) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, oshibka);
+        return 2;
+    }
+    @synchronized (PinyZamok()) {
+        g_Piny = n;
+        if (n.hostov > 0) g_PinyEst = YES;
+    }
+    // Следующие запросы — на новых соединениях: на прежних набор не проверялся.
+    [[HTTP3PluginManager sharedInstance] smenitSessiyu];
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 static const struct luaL_Reg kFunctions[] = {
     {"request", L_request},
     {"initiateRequest", L_initiateRequest},
@@ -877,6 +1051,7 @@ static const struct luaL_Reg kFunctions[] = {
     {"getMemoryStats", L_getMemoryStats},
     {"collectGarbage", L_collectGarbage},
     {"pumpEvents", L_pumpEvents},
+    {"setPins", L_setPins},
     {NULL, NULL}
 };
 

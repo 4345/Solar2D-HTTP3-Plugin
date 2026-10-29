@@ -16,6 +16,7 @@
 --      - http3.getMemoryStats()
 --      - http3.collectGarbage()
 --      - http3.pumpEvents(seconds)
+--      - http3.setPins{ hosts, pins, expires } — привязка ключей (по желанию)
 -------------------------------------------------------------------------------
 
 local M = {}
@@ -194,7 +195,10 @@ function M.request(url, method, listener, params)
         return p
     end
 
-    -- Обёртка над слушателем для перехвата ошибок транспорта и аннотации события
+    -- Обёртка над слушателем для перехвата ошибок транспорта и аннотации события.
+    -- Повтор через network.request — ТОЛЬКО при NATIVE_TRANSPORT_FAILED. Отказ
+    -- привязки ключей (reason = "PIN_FAILED", http3.setPins) доходит до
+    -- вызывающего как есть: повтор мимо привязки её бы обошёл.
     local function wrapperListener(event)
         if event and event.isError and event.reason == "NATIVE_TRANSPORT_FAILED" then
             -- Адрес и настоящая причина: нативный слой кладёт текст ошибки в
@@ -530,6 +534,50 @@ function M.progress_podderzhivaetsya()
     -- ответ теперь не «есть ли опрос», а «есть ли чем показать ход передачи».
     -- Старые сборки Windows без checkProgress по-прежнему отвечают false.
     return cLib.checkRequest == nil or cLib.checkProgress ~= nil
+end
+
+--- Привязка открытых ключей сервера (SPKI pinning). ПО ЖЕЛАНИЮ: без вызова
+-- проверка сертификата только системная — ровно как у network.request и как
+-- было до появления этой функции.
+--
+--   local ok, prichina = http3.setPins({
+--       hosts   = { "api.example.com" },                 -- поимённо, без поддоменов
+--       pins    = { "sha256/<base64>", ... },            -- SHA-256 от SubjectPublicKeyInfo
+--       expires = os.time{ year = 2028, month = 1, day = 1 }, -- конец срока набора
+--   })
+--
+-- Для хоста из списка ответ принимается, только если в проверенной системой
+-- цепочке (лист, промежуточные, корень) есть ключ из набора; иначе запрос
+-- завершается событием isError = true, reason = "PIN_FAILED" — до отправки
+-- запроса и БЕЗ повтора через network.request (повтор мимо привязки сделал
+-- бы её бессмысленной). Срок нужен, чтобы приложение, которое давно не
+-- обновляли, не осталось без связи, когда удостоверяющий центр сменит ключи:
+-- после срока — снова только системная проверка. Закрепляйте ключи корней и
+-- запасные, а не ключ сервера — он меняется при каждом продлении.
+--
+-- Звать ДО первого запроса: на Android движок Cronet собирается один раз, и
+-- набор, заданный позже, отвергается (false). Пустой hosts — привязка снята
+-- (кроме Android после первого запроса).
+--
+-- Ответ: true — нативный слой принял набор; false и причина — не принял
+-- (нативного слоя нет, его сборка без привязки, неверные данные). Без
+-- нативного слоя запросы идут через network.request без привязки — так что
+-- false стоит хотя бы записать в журнал.
+function M.setPins(nabor)
+    if type(nabor) ~= "table" or type(nabor.hosts) ~= "table" or type(nabor.pins) ~= "table"
+            or type(nabor.expires) ~= "number" then
+        return false, "нужна таблица { hosts = {...}, pins = {...}, expires = число }"
+    end
+    local cLib = loadNativeLibrary()
+    if not cLib then
+        return false, "нативного слоя нет — запросы идут через network.request без привязки"
+    end
+    if type(cLib.setPins) ~= "function" then
+        return false, "нативный слой этой платформы собран без привязки"
+    end
+    local ok, prinyat, prichina = pcall(cLib.setPins, nabor.hosts, nabor.pins, nabor.expires)
+    if not ok then return false, tostring(prinyat) end
+    return prinyat == true, prichina
 end
 
 --- Скачивание файла: те же аргументы, что у network.download в Solar2D.

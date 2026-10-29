@@ -19,12 +19,15 @@ import org.chromium.net.CronetProvider;
 import org.chromium.net.UrlRequest;
 import org.chromium.net.UrlResponseInfo;
 import org.chromium.net.CronetException;
+import org.chromium.net.NetworkException;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -146,6 +149,50 @@ public class LuaLoaderInternal implements JavaFunction {
         }
     }
 
+    // --- Привязка ключей (http3.setPins) — ТОЛЬКО по вызову приложения ---
+    //
+    // Пока приложение не задало набор, ни одна строка ниже движок не меняет:
+    // проверка сертификата — системная, как была. С набором Cronet получает
+    // addPublicKeyPins на каждый хост (поимённо, без поддоменов, со сроком
+    // набора) и enablePublicKeyPinningBypassForLocalTrustAnchors(false): по
+    // умолчанию Cronet пропускает привязку для корней, установленных
+    // пользователем, — то есть ровно для прокси-перехватчиков.
+    //
+    // Отказ привязки (net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN) — НЕ сбой
+    // транспорта: в Lua уходит reason = "PIN_FAILED", и обёртка не повторяет
+    // запрос через network.request — повтор мимо привязки её бы обошёл.
+    //
+    // Набор задаётся до сборки движка (первого запроса): движок собирается
+    // один раз на процесс.
+    private static volatile String[] sPinHosty = null;     // null — привязки нет
+    private static volatile Set<byte[]> sPinKlyuchi = null;
+    private static volatile long sPinDoMs = 0;
+    private static final int OSHIBKA_PRIVYAZKI = -150;    // net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN
+
+    // Хост адреса — под привязкой: набор задан, срок не вышел, хост в списке.
+    private static boolean hostPodPrivyazkoy(String url) {
+        String[] hosty = sPinHosty;
+        if (hosty == null || System.currentTimeMillis() >= sPinDoMs) return false;
+        String host = hostIzUrl(url);
+        if (host == null) return false;
+        for (String h : hosty) {
+            if (h.equalsIgnoreCase(host)) return true;
+        }
+        return false;
+    }
+
+    // Отпечаток "sha256/<base64>" или "<base64>" — 32 байта; иначе null.
+    private static byte[] otpechatok(String s) {
+        if (s == null) return null;
+        if (s.startsWith("sha256/")) s = s.substring(7);
+        try {
+            byte[] b = android.util.Base64.decode(s, android.util.Base64.NO_WRAP);
+            return (b != null && b.length == 32) ? b : null;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     private static final Map<Integer, Zapros> sActiveRequestsMap = new ConcurrentHashMap<>();
     private static final AtomicLong sTotalCompleted = new AtomicLong(0);
     private static final AtomicLong sTotalFailed = new AtomicLong(0);
@@ -160,7 +207,8 @@ public class LuaLoaderInternal implements JavaFunction {
             new InitiateRequestWrapper("request"),
             new CancelWrapper(),
             new GetMemoryStatsWrapper(),
-            new CollectGarbageWrapper()
+            new CollectGarbageWrapper(),
+            new SetPinsWrapper()
         };
         // Имя модуля должно совпадать с тем, по которому его требуют:
         // require("plugin.http3.ntv") -> класс plugin.http3.ntv.LuaLoader -> сюда.
@@ -268,6 +316,21 @@ public class LuaLoaderInternal implements JavaFunction {
             builder.enableQuic(true);
             builder.enableHttp2(true);
             builder.enableBrotli(true);
+
+            // Привязка ключей — только если приложение задало набор (setPins).
+            String[] pinHosty = sPinHosty;
+            if (pinHosty != null && System.currentTimeMillis() < sPinDoMs) {
+                try {
+                    Date srok = new Date(sPinDoMs);
+                    for (String h : pinHosty) {
+                        builder.addPublicKeyPins(h, sPinKlyuchi, false, srok);
+                    }
+                    builder.enablePublicKeyPinningBypassForLocalTrustAnchors(false);
+                    Log.i(TAG, "Привязка ключей: хостов " + pinHosty.length + ", ключей " + sPinKlyuchi.size());
+                } catch (Throwable t) {
+                    Log.e(TAG, "Привязка ключей НЕ применена: " + t.getMessage());
+                }
+            }
 
             // Подсказки про HTTP/3 — см. коммент у sHostyPodskazki. Читаем
             // список прошлого запуска и добавляем хост текущего запроса.
@@ -552,6 +615,61 @@ public class LuaLoaderInternal implements JavaFunction {
     // ===========================================================================
     // Отмена запроса по ID
     // ===========================================================================
+    // ===========================================================================
+    // Lua-мост: setPins(hosts, pins, expires) -> true | false, причина
+    // Набор привязки ключей (см. sPinHosty). Пустые hosts — привязки нет.
+    // ===========================================================================
+    private static class SetPinsWrapper implements NamedJavaFunction {
+        @Override
+        public String getName() {
+            return "setPins";
+        }
+
+        private static int otkaz(LuaState L, String prichina) {
+            L.pushBoolean(false);
+            L.pushString(prichina);
+            return 2;
+        }
+
+        @Override
+        public int invoke(LuaState L) {
+            L.checkType(1, LuaType.TABLE);
+            L.checkType(2, LuaType.TABLE);
+            double srok = L.checkNumber(3);
+            List<String> hosty = new ArrayList<String>();
+            int n = L.length(1);
+            for (int i = 1; i <= n; i++) {
+                L.rawGet(1, i);
+                String h = L.toString(-1);
+                L.pop(1);
+                if (h == null || h.isEmpty()) return otkaz(L, "неверный хост");
+                hosty.add(h);
+            }
+            Set<byte[]> klyuchi = new HashSet<byte[]>();
+            int m = L.length(2);
+            for (int i = 1; i <= m; i++) {
+                L.rawGet(2, i);
+                byte[] k = otpechatok(L.toString(-1));
+                L.pop(1);
+                if (k == null) return otkaz(L, "неверный отпечаток (нужен sha256/<base64> 32 байт)");
+                klyuchi.add(k);
+            }
+            if (!hosty.isEmpty() && klyuchi.isEmpty()) return otkaz(L, "нет отпечатков");
+            // Тот же монитор, что у initializeCronet: набор не меняется посреди
+            // сборки движка.
+            synchronized (LuaLoaderInternal.class) {
+                if (sCronetInitialized) {
+                    return otkaz(L, "движок Cronet уже собран — setPins нужно звать до первого запроса");
+                }
+                sPinKlyuchi = klyuchi;
+                sPinDoMs = (long) (srok * 1000.0);
+                sPinHosty = hosty.isEmpty() ? null : hosty.toArray(new String[0]);
+            }
+            L.pushBoolean(true);
+            return 1;
+        }
+    }
+
     private static class CancelWrapper implements NamedJavaFunction {
         @Override
         public String getName() {
@@ -831,7 +949,15 @@ public class LuaLoaderInternal implements JavaFunction {
                 sActiveRequestsMap.remove(requestId);
                 sTotalFailed.incrementAndGet();
                 Log.w(TAG, "Cronet request failed: " + error.getMessage());
-                triggerFallback(dispatcher, listenerRef);
+                if (error instanceof NetworkException
+                        && ((NetworkException) error).getCronetInternalErrorCode() == OSHIBKA_PRIVYAZKI
+                        && hostPodPrivyazkoy(url)) {
+                    // Отказ привязки ключей — без повтора мимо неё (см. sPinHosty).
+                    soobshchitOshibku(dispatcher, listenerRef, "PIN_FAILED",
+                                      "Ключ сервера не из набора привязки");
+                } else {
+                    triggerFallback(dispatcher, listenerRef);
+                }
             }
 
             @Override

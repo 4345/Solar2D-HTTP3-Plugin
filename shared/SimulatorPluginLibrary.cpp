@@ -29,14 +29,17 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
+#include <wincrypt.h>
 #include <stdint.h>
 #include "msquic.h"
+#include "piny.h"
 
 #ifdef _MSC_VER
 #include <intrin.h>
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "crypt32.lib")
 static inline bool __sync_bool_compare_and_swap(volatile long* ptr, long oldval, long newval) {
     return _InterlockedCompareExchange(ptr, newval, oldval) == oldval;
 }
@@ -614,6 +617,110 @@ static void ReleaseRaceContext(RaceContext* race) {
 // вместе с сеансом уходят и его соединения. Понадобится снова - поднимется
 // заново, см. GetGlobalWinHttpSession.
 // ===========================================================================
+// ===========================================================================
+// ПРИВЯЗКА КЛЮЧЕЙ (http3.setPins, shared/piny.h). ВКЛЮЧАЕТСЯ ТОЛЬКО ВЫЗОВОМ
+// setPins: пока приложение его не сделало, набор пуст, и ни один путь ниже
+// не меняет поведения — ни флаги msquic, ни обработчики WinHTTP.
+//
+// Проверка — ДО отправки запроса: WinHTTP — в обратном вызове
+// SENDING_REQUEST (TLS уже установлен, данные ещё не ушли), msquic — в
+// событии PEER_CERTIFICATE_RECEIVED рукопожатия. Цепочка строится заново
+// системой (CertGetCertificateChain, корни Windows) от листа и промежуточных,
+// присланных сервером, и в ней ищется ключ из набора.
+//
+// Отказ привязки — НЕ сбой транспорта: результат помечается "PinFail", и
+// checkRequest отдаёт reason = "PIN_FAILED". Lua-обёртка повторяет через
+// network.request только NATIVE_TRANSPORT_FAILED — повтор мимо привязки
+// сделал бы её бессмысленной.
+// ===========================================================================
+static PinyNabor g_Piny;            // под g_CritSec
+static volatile long g_PinyEst = 0; // набор когда-либо задан — без него путь прежний
+// msquic загрузил учётные данные без события сертификата (набора тогда ещё не
+// было, либо версия msquic этих флагов не знает): хосты под привязкой идут по
+// TCP, где проверка есть.
+static volatile long g_QuicBezPrivyazki = 0;
+// Поколение набора: растёт на каждом setPins. Соединение QUIC проверено при
+// своём рукопожатии — соединение из пула, поднятое при прежнем наборе, новым
+// не проверено и запросу не выдаётся (PoolTake).
+static volatile long g_PinyPokolenie = 0;
+
+static double SeychasUnix(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (double)(t / 10000000ULL) - 11644473600.0;
+}
+
+// Хост под привязкой; nabor — снимок набора для проверки.
+static int PinyDlyaHosta(const char* host, PinyNabor* nabor) {
+    if (!g_PinyEst) return 0;
+    EnterCriticalSection(&g_CritSec);
+    *nabor = g_Piny;
+    LeaveCriticalSection(&g_CritSec);
+    return piny_host_pod_privyazkoy(nabor, host, SeychasUnix());
+}
+
+// Цепочка от листа leaf с промежуточными из dop до корня Windows: построена
+// без ошибок доверия и содержит ключ из набора.
+static int PinyProveritList(const PinyNabor* nabor, PCCERT_CONTEXT leaf, HCERTSTORE dop) {
+    CERT_CHAIN_PARA para;
+    memset(&para, 0, sizeof(para));
+    para.cbSize = sizeof(para);
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    if (!CertGetCertificateChain(NULL, leaf, NULL, dop, &para, 0, NULL, &chain) || !chain) return 0;
+    int ok = 0;
+    if (chain->TrustStatus.dwErrorStatus == CERT_TRUST_NO_ERROR && chain->cChain > 0) {
+        PCERT_SIMPLE_CHAIN prostaya = chain->rgpChain[0];
+        for (DWORD i = 0; i < prostaya->cElement && !ok; i++) {
+            PCCERT_CONTEXT c = prostaya->rgpElement[i]->pCertContext;
+            if (c && piny_klyuch_v_nabore(nabor, c->pbCertEncoded, c->cbCertEncoded)) ok = 1;
+        }
+    }
+    CertFreeCertificateChain(chain);
+    return ok;
+}
+
+// Сертификат сервера запроса WinHTTP (соединение уже установлено).
+static int PinyProveritWinHttp(const PinyNabor* nabor, HINTERNET hRequest) {
+    PCCERT_CONTEXT leaf = NULL;
+    DWORD dlina = sizeof(leaf);
+    if (!WinHttpQueryOption(hRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &leaf, &dlina) || !leaf) return 0;
+    int ok = PinyProveritList(nabor, leaf, leaf->hCertStore);
+    CertFreeCertificateContext(leaf);
+    return ok;
+}
+
+// Состояние проверки одного запроса WinHTTP (живёт на стеке Http1ThreadFunc).
+typedef struct PinyWinHttp {
+    PinyNabor nabor;
+    volatile long provereno; // 1 — ключ найден
+    volatile long otkaz;     // 1 — не найден, запрос закрыт до отправки
+} PinyWinHttp;
+
+// SENDING_REQUEST: TLS установлен, запрос ещё не ушёл. Ключа нет — закрыть
+// запрос здесь же: WinHttpSendRequest вернёт ERROR_WINHTTP_OPERATION_CANCELLED,
+// и ни заголовки, ни тело не уйдут. Закрытый дескриптор второй раз не
+// закрывается (см. Http1ThreadFunc).
+static void __stdcall PinyObratnyyVyzov(HINTERNET hInternet, DWORD_PTR kontekst, DWORD status,
+                                        LPVOID info, DWORD infoDlina) {
+    (void)info; (void)infoDlina;
+    PinyWinHttp* p = (PinyWinHttp*)kontekst;
+    if (!p || status != WINHTTP_CALLBACK_STATUS_SENDING_REQUEST || p->otkaz) return;
+    if (PinyProveritWinHttp(&p->nabor, hInternet)) {
+        p->provereno = 1;
+    } else {
+        p->otkaz = 1;
+        LogMsg("Http1ThreadFunc: ключ сервера не из набора привязки — запрос закрыт до отправки");
+        WinHttpCloseHandle(hInternet);
+    }
+}
+
+static int RavnyStroki(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
 #define POBED_QUIC_DLYA_ZAKRYTIYA_TCP 5
 static volatile long g_PobedQuicPodryad = 0;
 static volatile long g_TcpVPolyote = 0;
@@ -638,7 +745,8 @@ static void RaceFinish(RaceContext* race, RaceOutcome outcome, int status,
         // Публикуем результат ошибки если TCP завершён, отменён или QUIC потерпел сбой
         if (__sync_bool_compare_and_swap(&race->winnerAssigned, 0, 3)) {
             const char* msg = errMsg ? errMsg : "Transport failed";
-            AddResult(race->req->id, 1, 0, msg, MyStrLen(msg), "Error");
+            // "PinFail" — отказ привязки (checkRequest: PIN_FAILED, без повтора).
+            AddResult(race->req->id, 1, 0, msg, MyStrLen(msg), RavnyStroki(transport, "PinFail") ? "PinFail" : "Error");
         }
     }
 }
@@ -1176,6 +1284,8 @@ typedef struct Http3Conn {
     unsigned long poslednee;
     unsigned long prostoy;   // сколько соединение простояло к моменту выдачи из пула
     unsigned long nachalo_rukopozhatiya;   // засечка для замера, см. ZapomnitRukopozhatie
+    volatile long pin_otkaz; // рукопожатие отвергнуто привязкой ключей (PEER_CERTIFICATE_RECEIVED)
+    long pin_pokolenie;      // g_PinyPokolenie на момент рукопожатия
     Http3State* ozhidayushchiy;
     uint8_t ctrlBuf[16];
     uint8_t encoderBuf[8];
@@ -1306,7 +1416,7 @@ static Http3Conn* PoolTake(const char* host, int port) {
     for (int i = 0; i < HTTP3_POOL_SIZE; i++) {
         Http3Conn* c = g_Pool[i];
         if (!c) continue;
-        if (c->mertvo || (teper - c->poslednee) > HTTP3_CONN_IDLE_MS) {
+        if (c->mertvo || (teper - c->poslednee) > HTTP3_CONN_IDLE_MS || c->pin_pokolenie != g_PinyPokolenie) {
             if (!c->zanyat) { g_Pool[i] = NULL; LeaveCriticalSection(&g_PoolLock); PoolCloseConn(c); EnterCriticalSection(&g_PoolLock); }
             continue;
         }
@@ -1575,6 +1685,38 @@ static long __cdecl ConnectionCallback(HQUIC Connection, void* Context, QUIC_CON
             api->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)NoopStreamCallback, NULL);
             break;
         }
+        case QUIC_CONNECTION_EVENT_PEER_CERTIFICATE_RECEIVED: {
+            // Приходит, только если набор привязки был задан до загрузки
+            // учётных данных (GetGlobalMsQuicApi). Сертификаты — переносимые:
+            // лист в DER, цепочка сервера в PKCS7.
+            PinyNabor nabor;
+            if (!PinyDlyaHosta(c->host, &nabor)) break;
+            int ok = 0;
+            QUIC_BUFFER* list = (QUIC_BUFFER*)Event->PEER_CERTIFICATE_RECEIVED.Certificate;
+            QUIC_BUFFER* cep = (QUIC_BUFFER*)Event->PEER_CERTIFICATE_RECEIVED.Chain;
+            if (list && list->Buffer && list->Length) {
+                PCCERT_CONTEXT leaf = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                                                    list->Buffer, list->Length);
+                HCERTSTORE dop = NULL;
+                if (cep && cep->Buffer && cep->Length) {
+                    CRYPT_DATA_BLOB blob;
+                    blob.cbData = cep->Length;
+                    blob.pbData = cep->Buffer;
+                    dop = CertOpenStore(CERT_STORE_PROV_PKCS7, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, &blob);
+                }
+                if (leaf) {
+                    ok = PinyProveritList(&nabor, leaf, dop);
+                    CertFreeCertificateContext(leaf);
+                }
+                if (dop) CertCloseStore(dop, 0);
+            }
+            if (!ok) {
+                LogMsg("Http3: ключ сервера не из набора привязки — рукопожатие отвергнуто");
+                c->pin_otkaz = 1;
+                return QUIC_STATUS_BAD_CERTIFICATE;
+            }
+            break;
+        }
         default: break;
     }
     return 0;
@@ -1638,7 +1780,24 @@ static QUIC_API_TABLE* GetGlobalMsQuicApi() {
             memset(&cred, 0, sizeof(cred));
             cred.Type = QUIC_CREDENTIAL_TYPE_NONE;
             cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
-            g_MsQuicApiTable->ConfigurationLoadCredential(g_MsQuicConfiguration, &cred);
+            // Событие сертификата — только когда приложение задало набор
+            // привязки (http3.setPins): без него учётные данные те же, что
+            // всегда. Версия msquic, не знающая этих флагов, их не примет —
+            // тогда прежние флаги, а хосты под привязкой пойдут по TCP.
+            int sPrivyazkoy = 0;
+            if (g_PinyEst) {
+                cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT | QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED
+                           | QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES;
+                sPrivyazkoy = ((long)g_MsQuicApiTable->ConfigurationLoadCredential(g_MsQuicConfiguration, &cred)) >= 0;
+                if (!sPrivyazkoy) {
+                    LogMsg("msquic: учётные данные с событием сертификата не приняты — привязка только по TCP");
+                    cred.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+                }
+            }
+            if (!sPrivyazkoy) {
+                g_MsQuicApiTable->ConfigurationLoadCredential(g_MsQuicConfiguration, &cred);
+                g_QuicBezPrivyazki = 1;
+            }
         }
     }
 
@@ -1667,6 +1826,29 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
     }
 
     QUIC_API_TABLE* api = GetGlobalMsQuicApi();
+    PinyNabor naborQuic;
+    if (api && g_QuicBezPrivyazki && PinyDlyaHosta(host, &naborQuic)) {
+        // msquic загружен без события сертификата (набор задан позже первого
+        // запроса) — проверить ключ здесь нечем. Запрос отправляет TCP, где
+        // проверка есть, и результат публикует он. Не ветка «msquic
+        // недоступен» ниже: та публикует отказ сразу, и обёртка повторила бы
+        // запрос через network.request — мимо привязки.
+        LogMsg("Http3ThreadFunc: хост под привязкой, а msquic без события сертификата — запрос отправляет TCP");
+        race->quicSuccess = 0;
+        race->quicProgress = 1;   // оркестратору — второй TCP не поднимать
+        race->quicFinished = 2;
+        __sync_add_and_fetch(&race->refCount, 1);
+        HANDLE hTcp = CreateThread(NULL, 64 * 1024, Http1ThreadFunc, race, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (hTcp) {
+            CloseHandle(hTcp);
+        } else {
+            ReleaseRaceContext(race);
+            RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "TCP thread not started");
+        }
+        if (race->quicDoneEvent) SetEvent(race->quicDoneEvent);
+        ReleaseRaceContext(race);
+        return 0;
+    }
     if (!api || !g_MsQuicRegistration || !g_MsQuicConfiguration) {
         LogMsg("Http3ThreadFunc: msquic.dll / MsQuicOpenVersion недоступен, фоллбэк на TCP HTTP/1.1");
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "msquic.dll not available");
@@ -1723,6 +1905,7 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
         MyStrCopy(conn->host, sizeof(conn->host), host);
 
         conn->nachalo_rukopozhatiya = GetTickCount();
+        conn->pin_pokolenie = g_PinyPokolenie;
         st = api->ConnectionOpen(g_MsQuicRegistration, ConnectionCallback, conn, &conn->connection);
         LogHexVal("ConnectionOpen", st);
         state->connection = conn->connection;
@@ -1811,7 +1994,11 @@ static unsigned long __stdcall Http3ThreadFunc(void* param) {
         } else {
             LogMsg("Http3ThreadFunc: сбой транспорта MsQuic/HTTP3");
         }
-        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "Error", "MsQuic/HTTP3 transport failed");
+        if (conn && conn->pin_otkaz) {
+            RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "PinFail", "Ключ сервера не из набора привязки (QUIC)");
+        } else {
+            RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "Error", "MsQuic/HTTP3 transport failed");
+        }
     }
 
     LogMsg("Http3ThreadFunc: начало очистки MsQuic объектов сессии...");
@@ -2022,6 +2209,34 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         return 0;
     }
 
+    // ПРИВЯЗКА КЛЮЧЕЙ (только если приложение задало набор, http3.setPins):
+    // проверка — в обратном вызове SENDING_REQUEST, до отправки данных.
+    // Состояние — в куче: набор весит килобайты, а стек потока мал.
+    PinyWinHttp* piny = NULL;
+    if (g_PinyEst) {
+        piny = (PinyWinHttp*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PinyWinHttp));
+        if (piny && !PinyDlyaHosta(host, &piny->nabor)) {
+            HeapFree(GetProcessHeap(), 0, piny);
+            piny = NULL;
+        } else if (piny) {
+            DWORD_PTR kontekst = (DWORD_PTR)piny;
+            if (!WinHttpSetOption(hRequest, WINHTTP_OPTION_CONTEXT_VALUE, &kontekst, sizeof(kontekst))
+                || WinHttpSetStatusCallback(hRequest, PinyObratnyyVyzov, WINHTTP_CALLBACK_FLAG_SEND_REQUEST, 0)
+                       == WINHTTP_INVALID_STATUS_CALLBACK) {
+                // Проверить до отправки нечем — не отправляем вовсе.
+                LogMsg("Http1ThreadFunc: обратный вызов привязки не установлен — запрос не отправлен");
+                HeapFree(GetProcessHeap(), 0, piny);
+                WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hConnect);
+                RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "PinFail", "Привязка ключей: проверка недоступна");
+                ReleaseRaceContext(race);
+                __sync_add_and_fetch(&g_TcpVPolyote, -1);
+                HeapFree(GetProcessHeap(), 0, w_headers);
+                return 0;
+            }
+        }
+    }
+
     LogMsg("Http1ThreadFunc: WinHttpSendRequest...");
     int send_res = WinHttpSendRequest(
         hRequest,
@@ -2033,7 +2248,33 @@ static unsigned long __stdcall Http1ThreadFunc(void* param) {
         0
     );
 
-    if (!send_res || !WinHttpReceiveResponse(hRequest, NULL)) {
+    // Отказ привязки: дескриптор запроса закрыт в обратном вызове, второй раз
+    // его не закрываем. Обратного вызова не было (так не должно быть) —
+    // проверяем сейчас, до выдачи ответа. poluchen: 0 — ответ ещё не
+    // принимали, 1 — принят, -1 — не принят.
+    int poluchen = 0;
+    int pinOtkaz = piny && piny->otkaz;
+    if (piny && !pinOtkaz && send_res && !piny->provereno) {
+        poluchen = WinHttpReceiveResponse(hRequest, NULL) ? 1 : -1;
+        if (poluchen == 1) {
+            pinOtkaz = !PinyProveritWinHttp(&piny->nabor, hRequest);
+            if (pinOtkaz) {
+                LogMsg("Http1ThreadFunc: ключ сервера не из набора привязки (проверка после ответа)");
+                WinHttpCloseHandle(hRequest);
+            }
+        }
+    }
+    if (piny) HeapFree(GetProcessHeap(), 0, piny);
+    if (pinOtkaz) {
+        WinHttpCloseHandle(hConnect);
+        RaceFinish(race, RACE_FAILURE, 0, NULL, 0, "PinFail", "Ключ сервера не из набора привязки");
+        ReleaseRaceContext(race);
+        __sync_add_and_fetch(&g_TcpVPolyote, -1);
+        HeapFree(GetProcessHeap(), 0, w_headers);
+        return 0;
+    }
+
+    if (!send_res || poluchen == -1 || (poluchen == 0 && !WinHttpReceiveResponse(hRequest, NULL))) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         RaceFinish(race, RACE_FAILURE, 0, NULL, 0, NULL, "WinHttp Send/Receive failed");
@@ -2445,7 +2686,18 @@ static int checkRequest( lua_State *L )
     lua_pushboolean(L, res->is_error);
     lua_settable(L, -3);
 
-    if (res->is_error) {
+    if (res->is_error && RavnyStroki(res->transport, "PinFail")) {
+        // Отказ привязки ключей (http3.setPins): не сбой транспорта, повтора
+        // через network.request не будет. Текст причины — в error.
+        lua_pushstring(L, "reason");
+        lua_pushstring(L, "PIN_FAILED");
+        lua_settable(L, -3);
+
+        lua_pushstring(L, "error");
+        if (res->response_data) lua_pushlstring(L, res->response_data, res->response_len);
+        else lua_pushstring(L, "PIN_FAILED");
+        lua_settable(L, -3);
+    } else if (res->is_error) {
         lua_pushstring(L, "reason");
         lua_pushstring(L, "NATIVE_TRANSPORT_FAILED");
         lua_settable(L, -3);
@@ -2699,6 +2951,63 @@ static int pumpEvents( lua_State *L )
     return 0;
 }
 
+// [Lua] setPins(hosts, pins, expires) -> true | false, причина
+// Набор привязки ключей (shared/piny.h): hosts — имена поимённо, pins —
+// отпечатки "sha256/<base64>" SubjectPublicKeyInfo, expires — Unix-время
+// конца срока набора. Пустые hosts — привязка снята. Без вызова — проверка
+// только системная, как всегда.
+static int setPins( lua_State *L )
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    double srok = luaL_checknumber(L, 3);
+    PinyNabor* n = (PinyNabor*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PinyNabor));
+    if (!n) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "нет памяти");
+        return 2;
+    }
+    n->do_sekund = srok;
+    if (!g_CritSecInitialized) {
+        InitializeCriticalSection(&g_CritSec);
+        g_CritSecInitialized = 1;
+    }
+    const char* oshibka = NULL;
+    int hostov = (int)lua_objlen(L, 1);
+    for (int i = 1; i <= hostov && !oshibka; i++) {
+        lua_rawgeti(L, 1, i);
+        const char* h = lua_tostring(L, -1);
+        if (!h || !h[0] || MyStrLen(h) >= PINY_DLINA_HOSTA) oshibka = "неверный хост";
+        else if (n->hostov >= PINY_HOSTOV) oshibka = "слишком много хостов";
+        else MyStrCopy(n->hosty[n->hostov++], PINY_DLINA_HOSTA, h);
+        lua_pop(L, 1);
+    }
+    int klyuchey = (int)lua_objlen(L, 2);
+    for (int i = 1; i <= klyuchey && !oshibka; i++) {
+        lua_rawgeti(L, 2, i);
+        const char* k = lua_tostring(L, -1);
+        if (n->klyuchey >= PINY_KLYUCHEY) oshibka = "слишком много отпечатков";
+        else if (!piny_otpechatok(k, n->klyuchi[n->klyuchey])) oshibka = "неверный отпечаток (нужен sha256/<base64> 32 байт)";
+        else n->klyuchey++;
+        lua_pop(L, 1);
+    }
+    if (!oshibka && n->hostov > 0 && n->klyuchey == 0) oshibka = "нет отпечатков";
+    if (oshibka) {
+        HeapFree(GetProcessHeap(), 0, n);
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, oshibka);
+        return 2;
+    }
+    EnterCriticalSection(&g_CritSec);
+    g_Piny = *n;
+    LeaveCriticalSection(&g_CritSec);
+    if (n->hostov > 0) g_PinyEst = 1;
+    __sync_add_and_fetch(&g_PinyPokolenie, 1);
+    HeapFree(GetProcessHeap(), 0, n);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 // Функция открытия библиотеки
 static int Open( lua_State *L )
 {
@@ -2712,6 +3021,7 @@ static int Open( lua_State *L )
         { "getMemoryStats", getMemoryStats },
         { "collectGarbage", collectGarbage },
         { "pumpEvents", pumpEvents },
+        { "setPins", setPins },
         { NULL, NULL }
     };
     luaL_openlib( L, "plugin.http3.native", kVTable, 0 );
